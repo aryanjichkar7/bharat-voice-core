@@ -1,0 +1,27 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Large Model Binaries (Piper ONNX models ~120MB)
+voices/*.onnx
+voices/*.onnx.json
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

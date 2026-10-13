@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bharat Online Cabs - Autonomous Voice Dispatch</title>
+
+  <!-- Google Fonts: Plus Jakarta Sans & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+
+  <!-- Enterprise Mobility Stylesheet -->
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="executive-body">
+
+  <!-- Executive Top Bar -->
+  <header class="executive-topbar">
+    <div class="topbar-content">
+      
+      <!-- Brand & City Core Cluster -->
+      <div class="brand-group">
+        <div class="brand-symbol">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/>
+            <circle cx="7" cy="17" r="2"/>
+            <path d="M9 17h6"/>
+            <circle cx="17" cy="17" r="2"/>
+          </svg>
+        </div>
+        <div class="brand-details">
+          <div class="brand-name-row">
+            <span class="brand-name">Bharat Online Cabs</span>
+            <span class="city-badge">Nagpur Dispatch Core</span>
+          </div>
+          <div class="live-status-pill connected" id="liveStatusBadge">
+            <span class="pulse-dot"></span>
+            <span id="liveStatusLabel">Voice Core Active</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls Cluster: Language + GPS -->
+      <div class="topbar-controls">
+        <div class="lang-selector-group">
+          <button class="lang-pill active" data-lang="en">English</button>
+          <button class="lang-pill" data-lang="hi">हिंदी</button>
+          <button class="lang-pill" data-lang="mr">मराठी</button>
+        </div>
+
+        <div class="gps-badge">
+          <span class="gps-beacon-dot"></span>
+          <span id="gpsCoordsLabel">Nagpur (21.1458° N, 79.0882° E)</span>
+        </div>
+      </div>
+
+    </div>
+  </header>
+
+  <!-- Two-Column Executive Mobility Dashboard -->
+  <main class="dashboard-shell">
+    
+    <!-- LEFT COLUMN: Voice & Conversation Console (~48%) -->
+    <section class="console-pane">
+      <div class="panel-card console-card">
+        
+        <!-- Large Voice Orb / Mic Controller -->
+        <div class="orb-stage">
+          <div class="orb-container">
+            <div class="orb-ambient-glow" id="orbGlow"></div>
+            <div class="orb-wave wave-1"></div>
+            <div class="orb-wave wave-2"></div>
+            <div class="orb-wave wave-3"></div>
+
+            <button class="voice-orb idle" id="voiceOrb" aria-label="Toggle Voice Assistant">
+              <div class="orb-core">
+                <svg class="mic-icon" id="micIcon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                  <line x1="12" x2="12" y1="19" y2="22"/>
+                </svg>
+                <div class="sound-wave-bars" id="waveBars">
+                  <span></span><span></span><span></span><span></span><span></span>
+                </div>
+              </div>
+            </button>
+          </div>
+
+          <div class="orb-meta">
+            <h2 class="orb-status-title" id="orbStateTitle">Tap to Speak</h2>
+            <p class="orb-status-subtitle" id="orbStateSubtitle">Autonomous Voice Dispatch • Nagpur</p>
+          </div>
+        </div>
+
+        <!-- Smart Venue Pills (Disambiguation) -->
+        <div class="venue-pills-box" id="poiPillsSection" style="display: none;">
+          <div class="venue-pills-header">
+            <span>Multiple Outlets Found — Select or Speak:</span>
+          </div>
+          <div class="venue-pills-flow" id="poiPillsList"></div>
+        </div>
+
+        <!-- Live Conversation Feed -->
+        <div class="conversation-feed-wrap">
+          <div class="feed-header-row">
+            <span class="feed-header-title">Live Conversation Feed</span>
+            <button class="feed-clear-btn" id="clearTranscriptBtn">Clear</button>
+          </div>
+          <div class="feed-scroll-box" id="transcriptBox">
+            <div class="message-bubble bot">
+              <span class="speaker-tag">Disha (Voice Concierge)</span>
+              <p id="initialGreetingText">Hello! Welcome to Bharat Online Cabs. Where in Nagpur would you like to go?</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Auto-Typed Speech Box & Fallback Input -->
+        <div class="input-console-bar">
+          <input 
+            type="text" 
+            id="textInput" 
+            placeholder="Type or speak (e.g. 'Take me to Haldiram' or 'jewellers near me')..." 
+            autocomplete="off"
+          />
+          <button id="sendBtn" class="send-action-btn" aria-label="Send Message">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- RIGHT COLUMN: Interactive Map & Ride Telemetry (~52%) -->
+    <section class="telemetry-pane">
+      
+      <!-- Dedicated Map Card (height: 420px, rounded, subtle shadow) -->
+      <div class="map-card-wrapper">
+        <div id="map"></div>
+      </div>
+
+      <!-- Live Trip Telemetry Card (Directly Below Map) -->
+      <div class="panel-card trip-card" id="rideCard" style="display: none;">
+        <div class="trip-route-display">
+          <div class="route-point origin-point">
+            <span class="route-indicator origin-indicator"></span>
+            <div class="point-text">
+              <span class="point-tag">Pickup Location</span>
+              <span class="point-name">Current Location (Nagpur GPS)</span>
+            </div>
+          </div>
+          <div class="route-connector-track"></div>
+          <div class="route-point dest-point">
+            <span class="route-indicator dest-indicator"></span>
+            <div class="point-text">
+              <span class="point-tag">Destination</span>
+              <span class="point-name" id="cardDestName">Destination Landmark</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Telemetry Metric Grid -->
+        <div class="telemetry-metrics-grid">
+          <div class="metric-cell">
+            <span class="metric-label">Driving Distance</span>
+            <span class="metric-data" id="cardDistance">-- km</span>
+          </div>
+          <div class="metric-cell">
+            <span class="metric-label">Estimated Duration</span>
+            <span class="metric-data" id="cardDuration">-- mins</span>
+          </div>
+          <div class="metric-cell fare-cell">
+            <span class="metric-label">Calculated Fare</span>
+            <span class="fare-badge" id="cardFareAmount">₹--</span>
+          </div>
+        </div>
+
+        <button class="btn-primary-confirm" id="btnConfirmRide">
+          <span>Confirm Cab Booking</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        </button>
+      </div>
+
+      <!-- Active Ride Monitor HUD (Upon Booking Confirmation) -->
+      <div class="panel-card active-ride-hud" id="bookingCard" style="display: none;">
+        <div class="hud-header-bar">
+          <div class="hud-status-badge">
+            <span class="hud-live-dot"></span>
+            <span>Ride Active</span>
+          </div>
+          <div class="hud-chips-row">
+            <span class="booking-tag" id="confirmedBookingId">BOC-XXXX</span>
+            <span class="otp-pill" id="bookingOtpBadge">OTP: 4821</span>
+          </div>
+          <span class="eta-pill" id="driverEtaPill">3 mins away</span>
+        </div>
+
+        <!-- Driver & Vehicle Card -->
+        <div class="driver-summary-tile">
+          <div class="driver-avatar-box">RK</div>
+          <div class="driver-info-box">
+            <div class="driver-name-row">
+              <strong id="driverName">Rajesh Kumar</strong>
+              <span class="driver-rating-tag">★ 4.9</span>
+            </div>
+            <p class="driver-vehicle-line" id="driverVehicle">White Swift Dzire • MH 31 EQ 8421</p>
+          </div>
+        </div>
+
+        <!-- Voice Helper Hint -->
+        <div class="hud-helper-bar">
+          <span>💬 Say <em>"Where is my driver?"</em>, <em>"What is my OTP?"</em>, or <em>"Cancel ride"</em> anytime.</span>
+        </div>
+
+        <!-- Cancel Ride Button -->
+        <button class="btn-cancel-ride-action" id="btnCancelRide">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          <span>Cancel Ride</span>
+        </button>
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <!-- Application Client Logic -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
