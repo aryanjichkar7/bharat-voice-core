@@ -296,6 +296,7 @@ function connectWebSocket() {
 // ----------------------------------------------------------------------------- 4. Audio Ingestion via AudioWorklet
 async function startAudioCapture() {
   try {
+    setOrbState('requesting_mic');
     const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
     audioCaptureCtx = new AudioCtxClass();
     await audioCaptureCtx.resume();
@@ -322,13 +323,30 @@ async function startAudioCapture() {
         await audioCaptureCtx.audioWorklet.addModule('/static/pcm-recorder-worklet.js');
         workletNode = new AudioWorkletNode(audioCaptureCtx, 'pcm-recorder-processor');
         workletNode.port.onmessage = (e) => {
+          if (e.data && e.data.type === 'MIC_METER') {
+            if (e.data.rmsDb < -55) {
+              console.warn(`[MIC WARNING] Low input level (${e.data.rmsDb} dB). Please speak clearly or check mic sensitivity.`);
+            } else {
+              console.log(`[MIC METER] ${e.data.sourceRate}Hz -> 16kHz | RMS: ${e.data.rmsDb} dB | Peak: ${e.data.peak}`);
+            }
+            return;
+          }
+
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(e.data);
           }
         };
+
         source.connect(workletNode);
+        // Connect to a muted GainNode to guarantee continuous Web Audio graph rendering
+        const muteGain = audioCaptureCtx.createGain();
+        muteGain.gain.value = 0;
+        workletNode.connect(muteGain);
+        muteGain.connect(audioCaptureCtx.destination);
+
         isRecording = true;
         setOrbState('listening');
+        console.info(`[AUDIO PIPELINE] AudioWorklet active at native ${audioCaptureCtx.sampleRate} Hz -> 16000 Hz`);
         return;
       } catch (workletErr) {
         console.warn('AudioWorklet module failed, falling back to ScriptProcessor:', workletErr);
@@ -336,7 +354,7 @@ async function startAudioCapture() {
     }
 
     // Fallback ScriptProcessor
-    const bufferSize = 4096;
+    const bufferSize = 2048;
     micProcessor = audioCaptureCtx.createScriptProcessor(bufferSize, 1, 1);
     micProcessor.onaudioprocess = (e) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -352,9 +370,7 @@ async function startAudioCapture() {
     setOrbState('listening');
   } catch (err) {
     console.error('Microphone access error:', err);
-    setOrbState('error');
-    orbTitle.textContent = 'Microphone Blocked';
-    orbSubtitle.textContent = 'Please enable microphone access in your browser';
+    setOrbState('error', 'Microphone permission denied or device unavailable');
   }
 }
 
@@ -498,6 +514,20 @@ function handleServerTextMessage(text) {
         appendTranscript('bot', data.text);
         break;
 
+      case 'PERF_DIAGNOSTICS':
+        console.group(`⏱️ Turn Latency Diagnostics [${data.turn_id}]`);
+        console.table(data.timings);
+        console.groupEnd();
+        break;
+
+      case 'VAD_SPEECH_START':
+        setOrbState('processing_speech');
+        break;
+
+      case 'VAD_SPEECH_STOP':
+        setOrbState('preparing_response');
+        break;
+
       case 'POI_CANDIDATES':
         renderPoiCandidates(data.candidates || []);
         break;
@@ -521,6 +551,7 @@ function handleServerTextMessage(text) {
       case 'ERROR':
         console.error('Server error:', data.error);
         appendTranscript('bot', `Error: ${data.error}`);
+        setOrbState('error', data.error);
         break;
 
       default:
@@ -572,17 +603,45 @@ function setLanguage(lang) {
   }
 }
 
-function setOrbState(state) {
+function setOrbState(state, detail) {
   voiceOrb.className = `voice-orb ${state}`;
-  if (state === 'listening') {
-    orbTitle.textContent = 'Listening...';
-    orbSubtitle.textContent = `Speak in ${getLangName(currentLanguage)}`;
-  } else if (state === 'speaking') {
-    orbTitle.textContent = 'Disha Speaking...';
-    orbSubtitle.textContent = 'Voice Concierge Response';
-  } else if (state === 'idle') {
-    orbTitle.textContent = 'Tap to Speak';
-    orbSubtitle.textContent = 'Autonomous Voice Dispatch • Nagpur';
+  switch (state) {
+    case 'idle':
+      orbTitle.textContent = 'Tap to Speak';
+      orbSubtitle.textContent = 'Autonomous Voice Dispatch • Nagpur';
+      break;
+    case 'requesting_mic':
+      orbTitle.textContent = 'Requesting Microphone...';
+      orbSubtitle.textContent = 'Please allow microphone access in your browser';
+      break;
+    case 'listening':
+      orbTitle.textContent = 'Listening...';
+      orbSubtitle.textContent = `Speak in ${getLangName(currentLanguage)}`;
+      break;
+    case 'processing_speech':
+      orbTitle.textContent = 'Processing Speech...';
+      orbSubtitle.textContent = 'Transcribing your utterance';
+      break;
+    case 'preparing_response':
+      orbTitle.textContent = 'Routing & Quoting...';
+      orbSubtitle.textContent = 'Evaluating Nagpur destination & fare';
+      break;
+    case 'speaking':
+      orbTitle.textContent = 'Disha Speaking...';
+      orbSubtitle.textContent = 'Voice Concierge Response';
+      break;
+    case 'error':
+      orbTitle.textContent = 'Audio / System Error';
+      orbSubtitle.textContent = detail || 'Microphone or connection issue';
+      break;
+    case 'disconnected':
+      orbTitle.textContent = 'Disconnected';
+      orbSubtitle.textContent = 'Tap to reconnect voice dispatch';
+      break;
+    default:
+      orbTitle.textContent = 'Voice Assistant';
+      orbSubtitle.textContent = detail || 'Ready';
+      break;
   }
 }
 

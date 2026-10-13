@@ -47,6 +47,8 @@ from pipecat.frames.frames import (
     OutputTransportMessageUrgentFrame,
     TranscriptionFrame,
     TTSSpeakFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -85,8 +87,8 @@ MAX_SESSIONS = int(os.getenv("BOC_MAX_SESSIONS", "4"))
 
 IN_SAMPLE_RATE = 16000
 OUT_SAMPLE_RATE = 22050          # Piper medium voices are native 22.05 kHz -> no resampling
-VAD_STOP_SECS = 0.3              # VAD silence before speech segment closes
-TURN_SPEECH_TIMEOUT = 0.2        # extra wait for the user to resume -> ~500 ms turn end
+VAD_STOP_SECS = 0.25              # Responsive VAD silence before speech segment closes
+TURN_SPEECH_TIMEOUT = 0.10        # Minimal extra turn-end buffer
 ALLOWED_LANGS = ("en", "hi", "mr")
 STT_HOTWORDS = "Nagpur Sitabuldi Dharampeth Civil Lines Ramdaspeth Sadar Haldiram DMart Londe Jewellers Bharat Online Cabs"
 
@@ -317,12 +319,22 @@ class DynamicPiperTTSService(PiperTTSService):
         if voice_path.exists():
             self._voice = _CachedPiperVoice.load(voice_path)
 
+        t0 = time.time()
+        first_frame = True
         self.session.is_bot_speaking = True
+        total_audio_bytes = 0
         try:
             async for frame in super().run_tts(text, context_id):
+                if first_frame:
+                    first_frame = False
+                    logger.info(f"[{self.session.session_id}] Piper TTS TTFB: {time.time() - t0:.3f}s for {text[:35]!r}")
+                if isinstance(frame, OutputAudioRawFrame):
+                    total_audio_bytes += len(frame.audio)
                 yield frame
         finally:
-            await asyncio.sleep(0.35)
+            play_dur = (total_audio_bytes / 2) / OUT_SAMPLE_RATE if total_audio_bytes else 0.35
+            # Hold echo mute for the actual audible playback duration (capped to 2.5s)
+            await asyncio.sleep(min(play_dur, 2.5))
             self.session.is_bot_speaking = False
 
 
@@ -335,7 +347,8 @@ class MultilingualWhisperSTT(SegmentedSTTService):
         return False
 
     def __init__(self, session: Session, **kwargs):
-        super().__init__(**kwargs)
+        # 150ms trailing silence (instead of 500ms) eliminates dead air delay in Faster-Whisper
+        super().__init__(trailing_silence_secs=0.15, **kwargs)
         self.session = session
         self._model = get_whisper_model()
 
@@ -349,20 +362,22 @@ class MultilingualWhisperSTT(SegmentedSTTService):
             hotwords=STT_HOTWORDS,
             vad_filter=False,
         )
-        text = " ".join(s.text.strip() for s in segments if s.no_speech_prob < 0.6).strip()
+        text = " ".join(s.text.strip() for s in segments if s.no_speech_prob < 0.8).strip()
         return text, lang
 
     async def run_stt(self, audio: bytes):
         if self.session.is_bot_speaking:
+            logger.debug(f"[{self.session.session_id}] Discarding microphone audio during bot playback echo window")
             return
 
         audio_f32 = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
-        if audio_f32.size < IN_SAMPLE_RATE * 0.25:
+        if audio_f32.size < IN_SAMPLE_RATE * 0.20:
             return
 
         t0 = time.time()
         biased = self.session.language
         text, lang = await asyncio.to_thread(self._transcribe, audio_f32, biased)
+        dur = time.time() - t0
         if not text:
             return
 
@@ -373,7 +388,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
             logger.info(f"Filtered Whisper ghost hallucination: {text!r}")
             return
 
-        logger.info(f"STT [{lang}] ({time.time() - t0:.2f}s): {text}")
+        logger.info(f"[{self.session.session_id}] STT [{lang}] ({dur:.3f}s): {text}")
         try:
             language = Language(lang)
         except ValueError:
@@ -526,6 +541,47 @@ class SessionController(FrameProcessor):
                 await self._resolve_and_preview_trip(cand["lat"], cand["lon"], cand["name"])
                 return True
 
+        # 3. Fast Deterministic Destination Evaluation (Sub-Second Routing & Disambiguation)
+        if self.session.stage in ("GREETING", "AWAITING_DESTINATION", "DISAMBIGUATING"):
+            res = await asyncio.to_thread(se.evaluate_destination_intent, text, self.session.lat, self.session.lon)
+            if res and res.get("status") in ("EXACT", "DISAMBIGUATION_NEEDED"):
+                self.session.last_search = res
+                options = ([res["primary_match"]] if res.get("primary_match") else []) + res.get("alternatives", [])
+
+                # Push POI candidate markers to client immediately
+                await self.push_frame(ui_message({
+                    "type": "POI_CANDIDATES",
+                    "query": text,
+                    "status": res["status"],
+                    "candidates": [{k: c[k] for k in ("name", "short_address", "lat", "lon", "distance_km", "rating")}
+                                   for c in options[:10]]
+                }))
+
+                if res["status"] == "EXACT":
+                    pm = res["primary_match"]
+                    await self._resolve_and_preview_trip(pm["lat"], pm["lon"], pm["name"])
+                    return True
+
+                if res["status"] == "DISAMBIGUATION_NEEDED":
+                    self.session.stage = "DISAMBIGUATING"
+                    closest = options[0] if options else None
+                    hint = res.get("clarification_prompt") or (
+                        f"The closest option is {closest['name']} in {closest['short_address']}, about {closest['distance_km']} km away. Would you like to go there, or pick another from the map?"
+                    )
+                    lang = self.session.language
+                    if lang == "hi" and closest:
+                        spoken = f"आपके सबसे पास {closest['short_address']} में {closest['name']} है, लगभग {closest['distance_km']} किलोमीटर। क्या आप यहाँ जाना चाहेंगे या दूसरा विकल्प चुनेंगे?"
+                    elif lang == "mr" and closest:
+                        spoken = f"तुमच्या सर्वात जवळ {closest['short_address']} मध्ये {closest['name']} आहे, सुमारे {closest['distance_km']} किलोमीटर. आपण तिथे जाऊ इच्छिता का?"
+                    else:
+                        spoken = hint
+
+                    await self.push_frame(TTSSpeakFrame(spoken))
+                    await self.push_frame(ui_message({"type": "BOT_RESPONSE", "text": spoken}))
+                    if self.context and self.context.messages:
+                        self.context.messages.append({"role": "assistant", "content": spoken})
+                    return True
+
         return False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -590,8 +646,19 @@ class SessionController(FrameProcessor):
             if mtype == "TEXT_INPUT" and str(msg.get("text", "")).strip():
                 text = str(msg["text"]).strip()
                 self.session.turns += 1
-                await self.push_frame(ui_message({"type": "USER_TRANSCRIPT", "text": text, "source": "text"}))
+                turn_id = f"turn-{self.session.turns:03d}"
+                await self.push_frame(ui_message({"type": "USER_TRANSCRIPT", "text": text, "source": "text", "turn_id": turn_id}))
+                t_intent_start = time.time()
                 handled = await self._handle_text_turn(text)
+                intent_dur = time.time() - t_intent_start
+                await self.push_frame(ui_message({
+                    "type": "PERF_DIAGNOSTICS",
+                    "turn_id": turn_id,
+                    "timings": {
+                        "intent_ms": round(intent_dur * 1000),
+                        "deterministic_fast_path": handled,
+                    }
+                }))
                 if not handled:
                     await self.push_frame(
                         LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True))
@@ -601,26 +668,72 @@ class SessionController(FrameProcessor):
 
 
 class TranscriptTap(FrameProcessor):
-    """Mirrors final user transcripts to the UI and triggers state machine handling."""
+    """Mirrors final user transcripts, tracks stage timings, and manages voice states."""
 
     def __init__(self, session: Session, controller: SessionController, **kwargs):
         super().__init__(**kwargs)
         self.session = session
         self.controller = controller
+        self._vad_start_time = 0.0
+        self._vad_stop_time = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._vad_start_time = time.time()
+            logger.info(f"[{self.session.session_id}] [VAD] Speech onset detected")
+            await self.push_frame(ui_message({"type": "VAD_SPEECH_START"}))
+            return
+
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._vad_stop_time = time.time()
+            vad_dur = self._vad_stop_time - self._vad_start_time if self._vad_start_time else 0.0
+            logger.info(f"[{self.session.session_id}] [VAD] Speech stopped (speech duration: {vad_dur:.2f}s)")
+            await self.push_frame(ui_message({"type": "VAD_SPEECH_STOP"}))
+            return
+
         if isinstance(frame, TranscriptionFrame):
             text = frame.text.strip()
             if not text:
                 return
+            t_stt = time.time()
+            vad_dur = self._vad_stop_time - self._vad_start_time if self._vad_start_time else 0.0
+            stt_dur = t_stt - self._vad_stop_time if self._vad_stop_time else 0.0
             self.session.turns += 1
+            turn_id = f"turn-{self.session.turns:03d}"
+
+            logger.info(f"[{self.session.session_id}][{turn_id}] [TIMING] VAD: {vad_dur:.2f}s | STT: {stt_dur:.3f}s | Transcript: {text!r}")
             await self.push_frame(ui_message({
-                "type": "USER_TRANSCRIPT", "text": text, "source": "voice",
-                "language": str(frame.language) if frame.language else None}))
+                "type": "USER_TRANSCRIPT",
+                "text": text,
+                "source": "voice",
+                "turn_id": turn_id,
+                "language": str(frame.language) if frame.language else None,
+            }))
+
+            t_intent_start = time.time()
             handled = await self.controller._handle_text_turn(text)
+            intent_dur = time.time() - t_intent_start
+            total_turn_dur = time.time() - self._vad_stop_time if self._vad_stop_time else intent_dur
+
+            logger.info(f"[{self.session.session_id}][{turn_id}] [TIMING] Intent: {intent_dur:.3f}s | E2E Turn: {total_turn_dur:.3f}s (handled={handled})")
+
+            await self.push_frame(ui_message({
+                "type": "PERF_DIAGNOSTICS",
+                "turn_id": turn_id,
+                "timings": {
+                    "vad_speech_s": round(vad_dur, 2),
+                    "stt_ms": round(stt_dur * 1000),
+                    "intent_ms": round(intent_dur * 1000),
+                    "e2e_turn_ms": round(total_turn_dur * 1000),
+                    "deterministic_fast_path": handled,
+                }
+            }))
+
             if handled:
                 return
+
         await self.push_frame(frame, direction)
 
 

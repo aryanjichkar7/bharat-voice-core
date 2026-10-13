@@ -370,6 +370,37 @@ body.executive-body {
   display: flex;
 }
 
+.voice-orb.requesting_mic {
+  background: #fefce8;
+  border-color: #fde047;
+  box-shadow: 0 0 25px rgba(234, 179, 8, 0.3);
+}
+
+.voice-orb.processing_speech {
+  background: #ecfeff;
+  border-color: #06b6d4;
+  box-shadow: 0 0 30px rgba(6, 182, 212, 0.35);
+}
+
+.voice-orb.preparing_response {
+  background: #f5f3ff;
+  border-color: #8b5cf6;
+  box-shadow: 0 0 30px rgba(139, 92, 246, 0.35);
+}
+
+.voice-orb.error {
+  background: #fef2f2;
+  border-color: #ef4444;
+  box-shadow: 0 0 30px rgba(239, 68, 68, 0.35);
+}
+
+.voice-orb.disconnected {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  box-shadow: none;
+  opacity: 0.75;
+}
+
 @keyframes wave-expand {
   0% { transform: scale(0.8); opacity: 0.8; }
   100% { transform: scale(1.6); opacity: 0; }
