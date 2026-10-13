@@ -160,7 +160,6 @@ function initGoogleMap() {
   googleMap = new google.maps.Map(mapElement, {
     center: centerLatLng,
     zoom: 14,
-    mapId: 'DEMO_MAP_ID',
     disableDefaultUI: false,
     zoomControl: true,
     mapTypeControl: false,

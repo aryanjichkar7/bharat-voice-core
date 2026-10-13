@@ -52,20 +52,20 @@ async def run_tests():
     # 1. Check static assets
     with open("static/app.js", "r", encoding="utf-8") as f:
         app_js = f.read()
-    osm_present = "tile.openstreetmap.org" in app_js and "cartocdn" not in app_js
+    gmaps_present = "google.maps.Map" in app_js and "cartocdn" not in app_js
     has_select_poi = "SELECT_POI" in app_js and "CONFIRM_BOOKING" in app_js
-    record("Map Tile Check (OpenStreetMap)", osm_present, "Free OSM tiles verified, CartoDB watermarks removed")
+    record("Map Cartography Check (Google Maps JS)", gmaps_present, "Official Google Maps JS API verified, CartoDB removed")
     record("UI Protocol Handshake (SELECT_POI)", has_select_poi, "SELECT_POI & CONFIRM_BOOKING bindings present")
 
     with open("static/index.html", "r", encoding="utf-8") as f:
         index_html = f.read()
-    has_dock = "dispatch-dock" in index_html and "top-nav-bar" in index_html and "btn-confirm-ride" in index_html
-    record("Executive Mobility UI Architecture", has_dock, "Fullscreen map, floating nav bar & dispatch dock present")
+    has_executive_ui = "executive-topbar" in index_html and "telemetry-pane" in index_html and "btnConfirmRide" in index_html
+    record("Executive Mobility UI Architecture", has_executive_ui, "Executive topbar, console & telemetry panes present")
 
     with open("static/style.css", "r", encoding="utf-8") as f:
         style_css = f.read()
-    css_ok = ".dispatch-dock" in style_css and ".waypoint-route" in style_css and "#38bdf8" in style_css
-    record("Glassmorphic Dark Theme & Neon CSS", css_ok, "Dock styling, waypoint route line & neon cyan verified")
+    css_ok = ".executive-topbar" in style_css and ".trip-card" in style_css and "#2563eb" in style_css
+    record("Executive Slate Theme & Palette CSS", css_ok, "Executive styling, trip card & primary blue #2563eb verified")
 
     # 2. Launch server
     print("\n🚀 Starting test server on port", PORT, "...")
