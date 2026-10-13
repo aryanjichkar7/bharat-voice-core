@@ -90,12 +90,12 @@ OUT_SAMPLE_RATE = 22050          # Piper medium voices are native 22.05 kHz -> n
 VAD_STOP_SECS = 0.35              # Natural conversational silence before speech segment closes
 TURN_SPEECH_TIMEOUT = 0.15        # Turn-end buffer
 ALLOWED_LANGS = ("en", "hi", "mr")
-STT_HOTWORDS = "Nagpur Sitabuldi Dharampeth Civil Lines Ramdaspeth Sadar Haldiram DMart Londe Jewellers Bharat Online Cabs"
+STT_HOTWORDS = "Nagpur Sitabuldi Dharampeth Civil Lines Ramdaspeth Sadar Haldiram DMart Londe Jewellers Bharat Online Cabs Batukbhai Kothari Cotton Market Itwari Mahal Sakkardara Manish Nagar Wardha Road MIDC Hingna Gokulpeth Pratap Nagar Railway Station Airport"
 
 VOICE_MAP = {
     "en": "en_GB-cori-medium",
     "hi": "hi_IN-priyamvada-medium",
-    "mr": "hi_IN-priyamvada-medium",
+    "mr": "mr_IN-google-medium",
 }
 
 GREETINGS = {
@@ -170,12 +170,13 @@ STYLE & CONSTRAINTS
 - Reply in 1 or 2 concise, spoken sentences. Never use bullet points, lists, markdown, asterisks, emojis or symbols.
 - Speak money as "rupees" (or "रुपये"), never write the ₹ symbol.
 - The customer's GPS location is already known; never ask for it.
-- Never invent places, distances, or fares. Rely exclusively on tool outputs.
+- Never invent places, distances, fares, driver details, or booking outcomes. Rely exclusively on verified tool outputs and session state.
+- If asked unrelated questions, politely guide the customer back to cab booking in Nagpur.
 
 BOOKING WORKFLOW & TOOLS
 1. When the customer mentions any destination or category (e.g. jewelry shop, restaurant, landmark), call search_nearby_pois with that query.
 2. If search_nearby_pois returns DISAMBIGUATION_NEEDED:
-   Concierge Rule: Announce ONLY the single closest branch and its distance using the next_step instruction (e.g., "The closest jeweler near you in Dharampeth is [Name], about [X] meters away. Would you like to go there, or check the other options on your map?").
+   Concierge Rule: Announce ONLY the single closest branch and its distance using the next_step instruction (e.g., "The closest option is [Name] in [Area], about [X] meters away. Would you like to go there, or check the other options on your map?").
 3. When trip details are calculated, announce: "The trip is [X] km and the estimated fare is [Y] rupees. Shall I book this ride?"
 4. When the customer confirms, confirm the booking in one short sentence."""
 

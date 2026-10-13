@@ -27,6 +27,7 @@ mkdir -p voices
 VOICES=(
   "hi/hi_IN/patricia/medium/hi_IN-patricia-medium|hi/hi_IN/priyamvada/medium/hi_IN-priyamvada-medium"
   "en/en_IN/cora/medium/en_IN-cora-medium|en/en_GB/cori/medium/en_GB-cori-medium"
+  "mr/mr_IN/google/medium/mr_IN-google-medium|mr/mr_IN/google/medium/mr_IN-google-medium"
 )
 
 download_voice() {
