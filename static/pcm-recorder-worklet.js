@@ -15,6 +15,17 @@ class PcmRecorderProcessor extends AudioWorkletProcessor {
     this.buffer = [];
     this.chunkSize = 1024; // 1024 samples = 64 ms at 16 kHz for low-latency VAD
     this.phase = 0;
+    this.isPlaybackMuted = false;
+
+    // Listen for playback mute state from main thread
+    this.port.onmessage = (e) => {
+      if (e.data && e.data.type === 'SET_PLAYBACK_MUTE') {
+        this.isPlaybackMuted = Boolean(e.data.muted);
+        if (this.isPlaybackMuted) {
+          this.buffer = [];
+        }
+      }
+    };
 
     // Metering telemetry counters
     this.meterSamplesCount = 0;
@@ -23,6 +34,10 @@ class PcmRecorderProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs, parameters) {
+    if (this.isPlaybackMuted) {
+      this.buffer = [];
+      return true;
+    }
     const input = inputs[0];
     if (!input || input.length === 0 || input[0].length === 0) {
       return true;

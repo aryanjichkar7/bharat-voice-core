@@ -1,5 +1,5 @@
 /**
- * Bharat Online Cabs - Autonomous Voice Dispatch Client
+ * Bharat Online Cabs - Voice Assistant Client
  * Full-duplex Web Audio capture via AudioWorklet (16kHz PCM16) & streaming playback (22.05kHz PCM16).
  * Real Google Maps JavaScript API with responsive polyline, POI discovery, and honest dispatch telemetry.
  */
@@ -23,6 +23,13 @@ let activeAudioSources = [];
 let userLocation = { lat: DEFAULT_LAT, lon: DEFAULT_LON };
 let currentLanguage = 'en'; // 'en' | 'hi' | 'mr'
 
+let clientTurnSeq = 0;
+const renderedMsgIds = new Set();
+let isSendingText = false;
+let lastUserActivityTime = Date.now();
+let activeRideData = null;
+let currentRideState = 'IDLE'; // 'IDLE' | 'PROPOSAL' | 'RIDE_ACTIVE' | 'CANCELLED'
+
 // Google Maps State
 let googleMap = null;
 let googlePickupMarker = null;
@@ -35,8 +42,10 @@ let googleMapsBrowserKey = '';
 // DOM Elements
 const voiceOrb = document.getElementById('voiceOrb');
 const orbGlow = document.getElementById('orbGlow');
-const orbTitle = document.getElementById('orbStateTitle');
-const orbSubtitle = document.getElementById('orbStateSubtitle');
+const orbStateTitle = document.getElementById('orbStateTitle');
+const orbStateSubtitle = document.getElementById('orbStateSubtitle');
+const orbTitle = orbStateTitle;
+const orbSubtitle = orbStateSubtitle;
 
 const liveStatusBadge = document.getElementById('liveStatusBadge');
 const liveStatusLabel = document.getElementById('liveStatusLabel');
@@ -50,7 +59,13 @@ const clearTranscriptBtn = document.getElementById('clearTranscriptBtn');
 const poiPillsSection = document.getElementById('poiPillsSection');
 const poiPillsList = document.getElementById('poiPillsList');
 
-const rideCard = document.getElementById('rideCard');
+const cardIdleView = document.getElementById('cardIdleView');
+const cardProposalView = document.getElementById('cardProposalView');
+const cardActiveView = document.getElementById('cardActiveView');
+const cardCancelledView = document.getElementById('cardCancelledView');
+const btnChangeDestination = document.getElementById('btnChangeDestination');
+const btnPlanNewTrip = document.getElementById('btnPlanNewTrip');
+
 const cardOriginName = document.getElementById('cardOriginName');
 const cardDestName = document.getElementById('cardDestName');
 const cardFareAmount = document.getElementById('cardFareAmount');
@@ -58,7 +73,6 @@ const cardDistance = document.getElementById('cardDistance');
 const cardDuration = document.getElementById('cardDuration');
 const btnConfirmRide = document.getElementById('btnConfirmRide');
 
-const bookingCard = document.getElementById('bookingCard');
 const confirmedBookingId = document.getElementById('confirmedBookingId');
 const bookingOtpBadge = document.getElementById('bookingOtpBadge');
 const driverName = document.getElementById('driverName');
@@ -288,7 +302,7 @@ function connectWebSocket() {
       stopAudioCapture();
       setOrbState('idle');
       orbTitle.textContent = 'Tap to Speak';
-      orbSubtitle.textContent = 'Autonomous Voice Dispatch • Nagpur';
+      orbSubtitle.textContent = 'Voice Assistant';
     };
   });
 }
@@ -452,11 +466,25 @@ function handleServerAudioBuffer(arrayBuffer) {
 
   activeAudioSources.push(sourceNode);
 
+  // Mute microphone in worklet while assistant audio is outputting to prevent acoustic feedback
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'SET_PLAYBACK_MUTE', muted: true });
+  }
+
   sourceNode.onended = () => {
     const idx = activeAudioSources.indexOf(sourceNode);
     if (idx > -1) activeAudioSources.splice(idx, 1);
-    if (activeAudioSources.length === 0 && isRecording) {
-      setOrbState('listening');
+    if (activeAudioSources.length === 0) {
+      setTimeout(() => {
+        if (activeAudioSources.length === 0) {
+          if (workletNode) {
+            workletNode.port.postMessage({ type: 'SET_PLAYBACK_MUTE', muted: false });
+          }
+          if (isRecording) {
+            setOrbState('listening');
+          }
+        }
+      }, 150);
     }
   };
 
@@ -471,6 +499,12 @@ function interruptPlayback() {
   if (audioPlaybackCtx) {
     nextPlayTime = audioPlaybackCtx.currentTime;
   }
+  if (workletNode) {
+    workletNode.port.postMessage({ type: 'SET_PLAYBACK_MUTE', muted: false });
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'INTERRUPT_PLAYBACK' }));
+  }
   if (isRecording) {
     setOrbState('listening');
   }
@@ -481,6 +515,12 @@ function handleServerTextMessage(text) {
   try {
     const data = JSON.parse(text);
     console.log('Telemetry Frame:', data);
+
+    // Drop stale frames for superseded turns unless it's a lifecycle confirmation
+    if (data.turn_seq !== undefined && data.turn_seq < clientTurnSeq && data.type !== 'CONVERSATION_CLEARED' && data.type !== 'BOOKING_CONFIRMED') {
+      console.info(`[DROPPED] Discarding obsolete server frame (${data.type}) for turn_seq ${data.turn_seq} (current: ${clientTurnSeq})`);
+      return;
+    }
 
     switch (data.type) {
       case 'CONNECTION_STATUS':
@@ -504,14 +544,21 @@ function handleServerTextMessage(text) {
         break;
 
       case 'USER_TRANSCRIPT':
-        if (textInput) {
-          textInput.value = data.text;
-        }
-        appendTranscript('user', data.text);
+        // Do NOT set textInput.value: preserves user draft and avoids input stuck with sent command
+        appendTranscript('user', data.text, data.msg_id, data.turn_seq);
+        recordActivity();
         break;
 
       case 'BOT_RESPONSE':
-        appendTranscript('bot', data.text);
+        appendTranscript('bot', data.text, data.msg_id, data.turn_seq);
+        break;
+
+      case 'CONVERSATION_CLEARED':
+        console.info('[TELEMETRY] Conversation cleared on server:', data);
+        break;
+
+      case 'DESTINATION_CLEARED':
+        setTripCardState('idle');
         break;
 
       case 'PERF_DIAGNOSTICS':
@@ -521,6 +568,7 @@ function handleServerTextMessage(text) {
         break;
 
       case 'VAD_SPEECH_START':
+        recordActivity();
         setOrbState('processing_speech');
         break;
 
@@ -550,7 +598,7 @@ function handleServerTextMessage(text) {
 
       case 'ERROR':
         console.error('Server error:', data.error);
-        appendTranscript('bot', `Error: ${data.error}`);
+        appendTranscript('bot', `Error: ${data.error}`, data.msg_id, data.turn_seq);
         setOrbState('error', data.error);
         break;
 
@@ -608,7 +656,7 @@ function setOrbState(state, detail) {
   switch (state) {
     case 'idle':
       orbTitle.textContent = 'Tap to Speak';
-      orbSubtitle.textContent = 'Autonomous Voice Dispatch • Nagpur';
+      orbSubtitle.textContent = 'Voice Assistant';
       break;
     case 'requesting_mic':
       orbTitle.textContent = 'Requesting Microphone...';
@@ -638,6 +686,10 @@ function setOrbState(state, detail) {
       orbTitle.textContent = 'Disconnected';
       orbSubtitle.textContent = 'Tap to reconnect voice dispatch';
       break;
+    case 'paused_inactivity':
+      orbTitle.textContent = 'Paused due to inactivity';
+      orbSubtitle.textContent = 'Tap to resume hands-free voice dispatch';
+      break;
     default:
       orbTitle.textContent = 'Voice Assistant';
       orbSubtitle.textContent = detail || 'Ready';
@@ -645,8 +697,16 @@ function setOrbState(state, detail) {
   }
 }
 
-function appendTranscript(role, text) {
+function appendTranscript(role, text, msgId, turnSeq) {
   if (!text || !text.trim()) return;
+  if (msgId && renderedMsgIds.has(msgId)) return;
+  if (turnSeq !== undefined && turnSeq < clientTurnSeq) {
+    console.warn(`[TRANSCRIPT] Discarding stale transcript from turn_seq ${turnSeq} (current: ${clientTurnSeq})`);
+    return;
+  }
+  if (msgId) {
+    renderedMsgIds.add(msgId);
+  }
 
   const bubble = document.createElement('div');
   bubble.className = `message-bubble ${role}`;
@@ -753,8 +813,49 @@ function renderPoiCandidates(candidates) {
   poiPillsSection.style.display = 'block';
 }
 
+function setTripCardState(state, data) {
+  if (cardIdleView) cardIdleView.style.display = 'none';
+  if (cardProposalView) cardProposalView.style.display = 'none';
+  if (cardActiveView) cardActiveView.style.display = 'none';
+  if (cardCancelledView) cardCancelledView.style.display = 'none';
+
+  if (state === 'idle') {
+    currentRideState = 'IDLE';
+    activeRideData = null;
+    if (cardIdleView) cardIdleView.style.display = 'block';
+  } else if (state === 'proposal') {
+    currentRideState = 'PROPOSAL';
+    if (cardProposalView) cardProposalView.style.display = 'block';
+  } else if (state === 'active') {
+    currentRideState = 'RIDE_ACTIVE';
+    activeRideData = data;
+    if (cardActiveView) cardActiveView.style.display = 'block';
+  } else if (state === 'cancelled') {
+    currentRideState = 'CANCELLED';
+    activeRideData = null;
+    if (cardCancelledView) cardCancelledView.style.display = 'block';
+  }
+}
+
+function recordActivity() {
+  lastUserActivityTime = Date.now();
+}
+
+function pauseDueToInactivity() {
+  console.info('[INACTIVITY] Pausing audio capture after 5 minutes of idle time');
+  stopAudioCapture();
+  setOrbState('paused_inactivity');
+}
+
+setInterval(() => {
+  if (isRecording && Date.now() - lastUserActivityTime > 5 * 60 * 1000) {
+    pauseDueToInactivity();
+  }
+}, 5000);
+
 function renderRoutePreview(data) {
   console.log('Rendering Route Preview:', data);
+  recordActivity();
 
   // Clear POI search markers from map
   googlePoiMarkers.forEach(m => m.setMap(null));
@@ -767,7 +868,7 @@ function renderRoutePreview(data) {
   if (cardDuration) cardDuration.textContent = `${data.duration_mins} mins`;
   if (cardFareAmount) cardFareAmount.textContent = `₹${Math.round(Number(data.fare_inr))}`;
 
-  rideCard.style.display = 'block';
+  setTripCardState('proposal', data);
   poiPillsSection.style.display = 'none';
 
   // Google Maps Cartography
@@ -834,6 +935,7 @@ function renderRoutePreview(data) {
 }
 
 function renderBookingConfirmed(data) {
+  recordActivity();
   confirmedBookingId.textContent = data.booking_id || 'BOC-CONFIRMED';
   if (bookingOtpBadge) {
     bookingOtpBadge.textContent = `OTP: ${data.otp || '4821'}`;
@@ -848,8 +950,7 @@ function renderBookingConfirmed(data) {
     driverEtaPill.textContent = `${data.driver.eta_mins} mins away`;
   }
 
-  bookingCard.style.display = 'block';
-  rideCard.style.display = 'none';
+  setTripCardState('active', data);
 
   if (liveStatusLabel) {
     liveStatusLabel.textContent = 'Active Ride Monitoring';
@@ -862,6 +963,7 @@ function renderBookingConfirmed(data) {
 }
 
 function handleRideCancelled() {
+  recordActivity();
   if (googleRoutePolyline) {
     googleRoutePolyline.setMap(null);
     googleRoutePolyline = null;
@@ -873,14 +975,12 @@ function handleRideCancelled() {
   googlePoiMarkers.forEach(m => m.setMap(null));
   googlePoiMarkers = [];
 
-  rideCard.style.display = 'none';
-  bookingCard.style.display = 'none';
+  setTripCardState('cancelled');
   poiPillsSection.style.display = 'none';
 
   if (liveStatusLabel) {
     liveStatusLabel.textContent = 'Voice Core Active';
   }
-  appendTranscript('bot', 'Your ride has been cancelled. Where would you like to go instead?');
 
   if (googleMap) {
     googleMap.setCenter(new google.maps.LatLng(userLocation.lat, userLocation.lon));
@@ -889,25 +989,77 @@ function handleRideCancelled() {
 }
 
 function sendTextMessage(text) {
-  if (!text || !text.trim()) return;
+  if (!text || !text.trim() || isSendingText) return;
+  isSendingText = true;
+  recordActivity();
+
+  clientTurnSeq++;
+  const payload = {
+    type: 'TEXT_INPUT',
+    text: text.trim(),
+    turn_seq: clientTurnSeq
+  };
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  } else {
+    connectWebSocket().then(() => {
+      ws.send(JSON.stringify(payload));
+    });
+  }
+
+  setTimeout(() => {
+    isSendingText = false;
+  }, 300);
+}
+
+function clearConversationHistory() {
+  recordActivity();
+  interruptPlayback();
+  clientTurnSeq++;
+  transcriptBox.innerHTML = '';
+
+  if (currentRideState !== 'RIDE_ACTIVE') {
+    setTripCardState('idle');
+    if (googleRoutePolyline) {
+      googleRoutePolyline.setMap(null);
+      googleRoutePolyline = null;
+    }
+    if (googleDestMarker) {
+      googleDestMarker.setMap(null);
+      googleDestMarker = null;
+    }
+    googlePoiMarkers.forEach(m => m.setMap(null));
+    googlePoiMarkers = [];
+    poiPillsSection.style.display = 'none';
+  }
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
-      type: 'TEXT_INPUT',
-      text: text.trim()
+      type: 'CLEAR_CONVERSATION',
+      turn_seq: clientTurnSeq
     }));
-  } else {
-    connectWebSocket().then(() => {
-      ws.send(JSON.stringify({
-        type: 'TEXT_INPUT',
-        text: text.trim()
-      }));
-    });
   }
+
+  if (isRecording) {
+    setOrbState('listening');
+  } else {
+    setOrbState('idle');
+  }
+  console.info(`[CLEAR] Conversation cleared (clientTurnSeq=${clientTurnSeq}, rideActive=${currentRideState === 'RIDE_ACTIVE'})`);
 }
 
 // ----------------------------------------------------------------------------- 8. Event Listeners
 voiceOrb.addEventListener('click', async () => {
+  recordActivity();
+  if (voiceOrb.classList.contains('paused_inactivity')) {
+    try {
+      await startAudioCapture();
+    } catch (e) {
+      console.error(e);
+    }
+    return;
+  }
   if (!isRecording) {
     try {
       await connectWebSocket();
@@ -922,6 +1074,7 @@ voiceOrb.addEventListener('click', async () => {
 });
 
 btnConfirmRide.addEventListener('click', () => {
+  recordActivity();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'CONFIRM_BOOKING' }));
   }
@@ -929,15 +1082,41 @@ btnConfirmRide.addEventListener('click', () => {
 
 if (btnCancelRide) {
   btnCancelRide.addEventListener('click', () => {
+    recordActivity();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'CANCEL_RIDE' }));
     }
   });
 }
 
+if (btnChangeDestination) {
+  btnChangeDestination.addEventListener('click', () => {
+    recordActivity();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'CHANGE_DESTINATION' }));
+    }
+    if (googleRoutePolyline) {
+      googleRoutePolyline.setMap(null);
+      googleRoutePolyline = null;
+    }
+    if (googleDestMarker) {
+      googleDestMarker.setMap(null);
+      googleDestMarker = null;
+    }
+    setTripCardState('idle');
+  });
+}
+
+if (btnPlanNewTrip) {
+  btnPlanNewTrip.addEventListener('click', () => {
+    recordActivity();
+    setTripCardState('idle');
+  });
+}
+
 sendBtn.addEventListener('click', () => {
   const val = textInput.value;
-  if (val.trim()) {
+  if (val && val.trim()) {
     sendTextMessage(val);
     textInput.value = '';
   }
@@ -945,12 +1124,13 @@ sendBtn.addEventListener('click', () => {
 
 textInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
+    e.preventDefault();
     sendBtn.click();
   }
 });
 
 clearTranscriptBtn.addEventListener('click', () => {
-  transcriptBox.innerHTML = '';
+  clearConversationHistory();
 });
 
 document.querySelectorAll('.lang-pill').forEach(pill => {

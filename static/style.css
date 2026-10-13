@@ -1148,3 +1148,162 @@ body.executive-body {
   pointer-events: none;
 }
 
+/* -------------------------------------------------------------------------- Comprehensive Trip Dashboard Card */
+.trip-dashboard-card {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 240px;
+  animation: slide-up 0.25s ease-out;
+}
+
+.trip-subview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+}
+
+.subview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.status-indicator-cluster {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.subview-title {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.trip-status-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 4px 10px;
+  border-radius: 9999px;
+}
+
+.badge-idle {
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  color: var(--text-secondary);
+}
+
+.badge-proposal {
+  background: var(--primary-blue-subtle);
+  border: 1px solid var(--primary-blue-border);
+  color: var(--primary-blue);
+}
+
+.badge-cancelled {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #dc2626;
+}
+
+.idle-guidance-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: var(--radius-md);
+}
+
+.guidance-icon {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.guidance-text strong {
+  display: block;
+  font-size: 0.88rem;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.guidance-text p {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.proposal-action-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.proposal-action-row .btn-primary-confirm {
+  flex: 1;
+}
+
+.btn-secondary-action {
+  padding: 10px 18px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--card-border);
+  background: #f8fafc;
+  color: var(--text-secondary);
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-secondary-action:hover {
+  background: #f1f5f9;
+  color: var(--text-primary);
+  border-color: #cbd5e1;
+}
+
+.hud-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cancelled-notice-box {
+  padding: 16px;
+  background: #fff1f2;
+  border: 1px solid #fecdd3;
+  border-radius: var(--radius-md);
+  color: #9f1239;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.cancelled-notice-box p {
+  margin: 0;
+}
+
+/* Paused due to Inactivity Orb State */
+.voice-orb.paused_inactivity {
+  background: linear-gradient(135deg, #d97706, #b45309);
+  box-shadow: 0 0 20px rgba(217, 119, 6, 0.4);
+}
+
+.voice-orb.paused_inactivity .mic-icon {
+  display: block;
+  opacity: 0.8;
+}
+
+.voice-orb.paused_inactivity .sound-wave-bars {
+  display: none;
+}
+
