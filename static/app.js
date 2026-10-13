@@ -1,6 +1,7 @@
 /**
- * Bharat Online Cabs - Executive Voice Dispatch Client
- * Full-duplex Web Audio capture (16kHz PCM16) & streaming playback (22.05kHz PCM16).
+ * Bharat Online Cabs - Autonomous Voice Dispatch Client
+ * Full-duplex Web Audio capture via AudioWorklet (16kHz PCM16) & streaming playback (22.05kHz PCM16).
+ * Real Google Maps JavaScript API with responsive polyline, POI discovery, and honest dispatch telemetry.
  */
 
 // Configuration & Default Coordinates (Nagpur, MH)
@@ -14,18 +15,22 @@ let ws = null;
 let audioCaptureCtx = null;
 let audioPlaybackCtx = null;
 let micStream = null;
-let micProcessor = null;
+let workletNode = null;
+let micProcessor = null; // fallback
 let isRecording = false;
 let nextPlayTime = 0;
 let activeAudioSources = [];
 let userLocation = { lat: DEFAULT_LAT, lon: DEFAULT_LON };
-let currentLanguage = 'en'; // default: 'en' | 'hi' | 'mr'
+let currentLanguage = 'en'; // 'en' | 'hi' | 'mr'
 
-let map = null;
-let userMarker = null;
-let destMarker = null;
-let routeGeoJsonLayer = null;
-let poiMarkers = [];
+// Google Maps State
+let googleMap = null;
+let googlePickupMarker = null;
+let googleDestMarker = null;
+let googleRoutePolyline = null;
+let googlePoiMarkers = [];
+let googleMapsLoaded = false;
+let googleMapsBrowserKey = '';
 
 // DOM Elements
 const voiceOrb = document.getElementById('voiceOrb');
@@ -46,6 +51,7 @@ const poiPillsSection = document.getElementById('poiPillsSection');
 const poiPillsList = document.getElementById('poiPillsList');
 
 const rideCard = document.getElementById('rideCard');
+const cardOriginName = document.getElementById('cardOriginName');
 const cardDestName = document.getElementById('cardDestName');
 const cardFareAmount = document.getElementById('cardFareAmount');
 const cardDistance = document.getElementById('cardDistance');
@@ -59,46 +65,55 @@ const driverName = document.getElementById('driverName');
 const driverVehicle = document.getElementById('driverVehicle');
 const driverEtaPill = document.getElementById('driverEtaPill');
 const btnCancelRide = document.getElementById('btnCancelRide');
+const mapFallbackBanner = document.getElementById('mapFallbackBanner');
 
-// ----------------------------------------------------------------------------- 1. Map Initialization
-function initMap() {
-  map = L.map('map', {
-    zoomControl: false,
-    attributionControl: false
-  }).setView([userLocation.lat, userLocation.lon], 14);
+// ----------------------------------------------------------------------------- 1. Google Maps Initialization
+window.gm_authFailure = function () {
+  console.warn('Google Maps authentication failure. Check GOOGLE_MAPS_BROWSER_API_KEY restrictions.');
+  if (mapFallbackBanner) {
+    mapFallbackBanner.style.display = 'flex';
+    mapFallbackBanner.querySelector('.banner-text span').innerHTML =
+      'Google Maps API Key Authentication Failed. Check API restrictions in Google Cloud Console.';
+  }
+};
 
-  // Bulletproof, keyless OpenStreetMap tile layer
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '© OpenStreetMap contributors'
-  }).addTo(map);
+async function loadMapEngine() {
+  try {
+    const res = await fetch('/api/config');
+    const config = await res.json();
+    googleMapsBrowserKey = config.google_maps_browser_key || '';
 
-  // Pickup Pin: Green pulsing circular radar
-  const pickupIcon = L.divIcon({
-    className: 'custom-pickup-marker',
-    html: `
-      <div class="radar-pin green">
-        <div class="radar-ring"></div>
-        <div class="radar-core"></div>
-      </div>
-    `,
-    iconSize: [28, 28],
-    iconAnchor: [14, 14]
-  });
+    if (config.default_lat && config.default_lon) {
+      userLocation.lat = config.default_lat;
+      userLocation.lon = config.default_lon;
+    }
 
-  userMarker = L.marker([userLocation.lat, userLocation.lon], { icon: pickupIcon }).addTo(map);
-  userMarker.bindPopup('<b>Current Pickup Location</b><br>Nagpur, Maharashtra').openPopup();
+    if (googleMapsBrowserKey) {
+      loadGoogleMapsScript(googleMapsBrowserKey);
+    } else {
+      console.info('GOOGLE_MAPS_BROWSER_API_KEY not configured. Displaying setup guidance.');
+      showMapConfigBanner();
+      renderMapPlaceholder();
+    }
+  } catch (err) {
+    console.error('Error fetching /api/config:', err);
+    showMapConfigBanner();
+    renderMapPlaceholder();
+  }
 
-  // Try Browser GPS
+  // Attempt browser GPS acquisition
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         userLocation.lat = pos.coords.latitude;
         userLocation.lon = pos.coords.longitude;
-        userMarker.setLatLng([userLocation.lat, userLocation.lon]);
-        map.setView([userLocation.lat, userLocation.lon], 15);
         if (gpsCoordsLabel) {
           gpsCoordsLabel.textContent = `GPS (${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E)`;
+        }
+        if (googleMap && googlePickupMarker) {
+          const latLng = new google.maps.LatLng(userLocation.lat, userLocation.lon);
+          googlePickupMarker.setPosition(latLng);
+          googleMap.setCenter(latLng);
         }
       },
       () => {
@@ -107,6 +122,97 @@ function initMap() {
       { timeout: 5000 }
     );
   }
+}
+
+function showMapConfigBanner() {
+  if (mapFallbackBanner) {
+    mapFallbackBanner.style.display = 'flex';
+  }
+}
+
+function loadGoogleMapsScript(apiKey) {
+  if (window.google && window.google.maps) {
+    initGoogleMap();
+    return;
+  }
+
+  const script = document.createElement('script');
+  script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&libraries=geometry`;
+  script.async = true;
+  script.defer = true;
+  script.onload = () => {
+    googleMapsLoaded = true;
+    initGoogleMap();
+  };
+  script.onerror = () => {
+    console.error('Failed to load Google Maps script.');
+    showMapConfigBanner();
+    renderMapPlaceholder();
+  };
+  document.head.appendChild(script);
+}
+
+function initGoogleMap() {
+  const mapElement = document.getElementById('map');
+  if (!mapElement || !window.google || !window.google.maps) return;
+
+  const centerLatLng = { lat: userLocation.lat, lng: userLocation.lon };
+  googleMap = new google.maps.Map(mapElement, {
+    center: centerLatLng,
+    zoom: 14,
+    mapId: 'DEMO_MAP_ID',
+    disableDefaultUI: false,
+    zoomControl: true,
+    mapTypeControl: false,
+    streetViewControl: false,
+    fullscreenControl: false,
+    styles: [
+      { featureType: 'poi.business', stylers: [{ visibility: 'on' }] },
+      { featureType: 'transit', stylers: [{ visibility: 'on' }] }
+    ]
+  });
+
+  // Pickup marker (Radar pin)
+  const pickupSvg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30">
+      <circle cx="15" cy="15" r="12" fill="#10b981" fill-opacity="0.25"/>
+      <circle cx="15" cy="15" r="7" fill="#10b981" stroke="#ffffff" stroke-width="2.5"/>
+    </svg>
+  `;
+
+  googlePickupMarker = new google.maps.Marker({
+    position: centerLatLng,
+    map: googleMap,
+    title: 'Pickup Location (Nagpur)',
+    icon: {
+      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(pickupSvg),
+      scaledSize: new google.maps.Size(30, 30),
+      anchor: new google.maps.Point(15, 15)
+    }
+  });
+
+  if (mapFallbackBanner) {
+    mapFallbackBanner.style.display = 'none';
+  }
+}
+
+function renderMapPlaceholder() {
+  const mapElement = document.getElementById('map');
+  if (!mapElement || googleMap) return;
+
+  mapElement.innerHTML = `
+    <div style="width: 100%; height: 100%; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); display: flex; flex-direction: column; align-items: center; justify-content: center; color: #94a3b8; text-align: center; padding: 24px;">
+      <div style="width: 56px; height: 56px; border-radius: 50%; background: rgba(37, 99, 235, 0.15); border: 2px solid #2563eb; display: flex; align-items: center; justify-content: center; margin-bottom: 14px;">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2">
+          <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon>
+          <line x1="8" y1="2" x2="8" y2="18"></line>
+          <line x1="16" y1="6" x2="16" y2="22"></line>
+        </svg>
+      </div>
+      <h3 style="color: #f1f5f9; font-size: 1.05rem; margin-bottom: 6px;">Nagpur Mobility Grid Ready</h3>
+      <p style="font-size: 0.82rem; max-width: 320px; line-height: 1.4;">Live coordinates: ${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E.<br>Provide <code>GOOGLE_MAPS_BROWSER_API_KEY</code> in <code>.env</code> to render vector cartography.</p>
+    </div>
+  `;
 }
 
 // ----------------------------------------------------------------------------- 2. Status Handshake
@@ -151,15 +257,12 @@ function connectWebSocket() {
     ws.onopen = () => {
       console.log('WebSocket connected');
       setConnectionStatus(true);
-
-      // Send CLIENT_INIT frame
       ws.send(JSON.stringify({
         type: 'CLIENT_INIT',
         lat: userLocation.lat,
         lon: userLocation.lon,
         lang: currentLanguage
       }));
-
       resolve(ws);
     };
 
@@ -191,7 +294,7 @@ function connectWebSocket() {
   });
 }
 
-// ----------------------------------------------------------------------------- 4. Audio Ingestion & Resampling
+// ----------------------------------------------------------------------------- 4. Audio Ingestion via AudioWorklet
 async function startAudioCapture() {
   try {
     const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
@@ -213,28 +316,43 @@ async function startAudioCapture() {
     });
 
     const source = audioCaptureCtx.createMediaStreamSource(micStream);
+
+    // AudioWorklet Pipeline
+    if (audioCaptureCtx.audioWorklet) {
+      try {
+        await audioCaptureCtx.audioWorklet.addModule('/static/pcm-recorder-worklet.js');
+        workletNode = new AudioWorkletNode(audioCaptureCtx, 'pcm-recorder-processor');
+        workletNode.port.onmessage = (e) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(e.data);
+          }
+        };
+        source.connect(workletNode);
+        isRecording = true;
+        setOrbState('listening');
+        return;
+      } catch (workletErr) {
+        console.warn('AudioWorklet module failed, falling back to ScriptProcessor:', workletErr);
+      }
+    }
+
+    // Fallback ScriptProcessor
     const bufferSize = 4096;
     micProcessor = audioCaptureCtx.createScriptProcessor(bufferSize, 1, 1);
-
     micProcessor.onaudioprocess = (e) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
       const inputFloat32 = e.inputBuffer.getChannelData(0);
       const resampled16k = downsampleBuffer(inputFloat32, audioCaptureCtx.sampleRate, IN_SAMPLE_RATE);
       const pcm16 = float32ToInt16(resampled16k);
-
       ws.send(pcm16.buffer);
     };
 
     source.connect(micProcessor);
     micProcessor.connect(audioCaptureCtx.destination);
     isRecording = true;
-
     setOrbState('listening');
-    orbTitle.textContent = 'Listening...';
-    orbSubtitle.textContent = `Speak in ${getLangName(currentLanguage)}`;
   } catch (err) {
-    console.error('Microphone error:', err);
+    console.error('Microphone access error:', err);
     setOrbState('error');
     orbTitle.textContent = 'Microphone Blocked';
     orbSubtitle.textContent = 'Please enable microphone access in your browser';
@@ -242,6 +360,10 @@ async function startAudioCapture() {
 }
 
 function stopAudioCapture() {
+  if (workletNode) {
+    workletNode.disconnect();
+    workletNode = null;
+  }
   if (micProcessor) {
     micProcessor.disconnect();
     micProcessor = null;
@@ -410,7 +532,7 @@ function handleServerTextMessage(text) {
   }
 }
 
-// ----------------------------------------------------------------------------- 7. UI Rendering & Interactions
+// ----------------------------------------------------------------------------- 7. UI Rendering & Map Cartography
 function getLangName(code) {
   if (code === 'hi') return 'Hindi';
   if (code === 'mr') return 'Marathi';
@@ -428,14 +550,18 @@ function updateLanguagePillsUI(lang) {
 }
 
 function setLanguage(lang) {
+  if (lang === 'gu') {
+    appendTranscript('bot', 'Gujarati neural voice model is currently in development. Please select English, Hindi, or Marathi.');
+    return;
+  }
   currentLanguage = lang;
   updateLanguagePillsUI(lang);
   const initialBubble = document.getElementById('initialGreetingText');
   if (initialBubble) {
     const greetings = {
-      'en': 'Hello! Welcome to Bharat Online Cabs. Where would you like to go today?',
-      'hi': 'नमस्ते! भारत ऑनलाइन कैब्स में आपका स्वागत है। आप कहाँ जाना चाहेंगे?',
-      'mr': 'नमस्कार! भारत ऑनलाईन कॅब्समध्ये आपले स्वागत आहे. आपल्याला कुठे जायचे आहे?'
+      'en': 'Hello! Welcome to Bharat Online Cabs. Where in Nagpur would you like to go?',
+      'hi': 'नमस्ते! भारत ऑनलाइन कैब्स में आपका स्वागत है। आप नागपुर में कहाँ जाना चाहेंगे?',
+      'mr': 'नमस्कार! भारत ऑनलाईन कॅब्समध्ये आपले स्वागत आहे. आपण नागपूरमध्ये कुठे जाऊ इच्छिता?'
     };
     initialBubble.textContent = greetings[lang] || greetings['en'];
   }
@@ -478,10 +604,7 @@ function appendTranscript(role, text) {
   bubble.appendChild(content);
 
   transcriptBox.appendChild(bubble);
-  const scrollBody = document.querySelector('.dock-body');
-  if (scrollBody) {
-    scrollBody.scrollTop = scrollBody.scrollHeight;
-  }
+  transcriptBox.scrollTop = transcriptBox.scrollHeight;
 }
 
 function renderPoiCandidates(candidates) {
@@ -490,44 +613,62 @@ function renderPoiCandidates(candidates) {
     return;
   }
 
-  // Clear previous map POI markers
-  poiMarkers.forEach(m => map.removeLayer(m));
-  poiMarkers = [];
+  // Clear previous Google Maps POI markers
+  googlePoiMarkers.forEach(m => m.setMap(null));
+  googlePoiMarkers = [];
 
-  // Plot Top 3 closest markers on the map
-  const topCandidates = candidates.slice(0, 3);
-  const bounds = L.latLngBounds([userLocation.lat, userLocation.lon]);
+  // Plot candidate markers if Google Maps is active
+  if (googleMap && window.google) {
+    const bounds = new google.maps.LatLngBounds();
+    bounds.extend(new google.maps.LatLng(userLocation.lat, userLocation.lon));
 
-  topCandidates.forEach((c, idx) => {
-    const badgeIcon = L.divIcon({
-      className: 'custom-poi-marker',
-      html: `<div class="poi-badge">${idx + 1}</div>`,
-      iconSize: [28, 28],
-      iconAnchor: [14, 14]
+    candidates.slice(0, 4).forEach((c, idx) => {
+      const pos = new google.maps.LatLng(c.lat, c.lon);
+      const m = new google.maps.Marker({
+        position: pos,
+        map: googleMap,
+        title: `${c.name} (${c.distance_km} km)`,
+        label: {
+          text: String(idx + 1),
+          color: '#ffffff',
+          fontWeight: '700',
+          fontSize: '12px'
+        },
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 13,
+          fillColor: '#2563eb',
+          fillOpacity: 1,
+          strokeColor: '#ffffff',
+          strokeWeight: 2.5
+        }
+      });
+
+      const infoWindow = new google.maps.InfoWindow({
+        content: `<div style="color: #0f172a; font-family: sans-serif; font-size: 13px;"><strong>${c.name}</strong><br>${c.short_address || ''}<br><span style="color: #2563eb; font-weight: 600;">${c.distance_km} km away</span></div>`
+      });
+
+      m.addListener('click', () => {
+        infoWindow.open(googleMap, m);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'SELECT_POI',
+            lat: c.lat,
+            lon: c.lon,
+            name: c.name
+          }));
+        }
+        poiPillsSection.style.display = 'none';
+      });
+
+      googlePoiMarkers.push(m);
+      bounds.extend(pos);
     });
 
-    const m = L.marker([c.lat, c.lon], { icon: badgeIcon }).addTo(map);
-    m.bindPopup(`<b>${c.name}</b><br>${c.short_address || ''}<br><b>${c.distance_km} km away</b>`);
-    m.on('click', () => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'SELECT_POI',
-          lat: c.lat,
-          lon: c.lon,
-          name: c.name
-        }));
-      }
-      poiPillsSection.style.display = 'none';
-    });
-    poiMarkers.push(m);
-    bounds.extend([c.lat, c.lon]);
-  });
-
-  if (topCandidates.length > 0) {
-    map.fitBounds(bounds, { padding: [60, 60], maxZoom: 16 });
+    googleMap.fitBounds(bounds, { top: 60, bottom: 60, left: 60, right: 60 });
   }
 
-  // Render chips in console
+  // Render clickable venue chips
   poiPillsList.innerHTML = '';
   candidates.slice(0, 4).forEach((c, i) => {
     const card = document.createElement('button');
@@ -558,60 +699,79 @@ function renderRoutePreview(data) {
   console.log('Rendering Route Preview:', data);
 
   // Clear POI search markers from map
-  poiMarkers.forEach(m => map.removeLayer(m));
-  poiMarkers = [];
+  googlePoiMarkers.forEach(m => m.setMap(null));
+  googlePoiMarkers = [];
 
   // Update Trip Summary HUD
-  cardDestName.textContent = data.destination || 'Destination';
-  cardDistance.textContent = `${Number(data.distance_km).toFixed(1)} km`;
-  cardDuration.textContent = `${data.duration_mins} mins`;
-  cardFareAmount.textContent = `₹${Number(data.fare_inr).toFixed(2)}`;
+  if (cardOriginName) cardOriginName.textContent = `Current Location (${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E)`;
+  if (cardDestName) cardDestName.textContent = data.destination || 'Destination';
+  if (cardDistance) cardDistance.textContent = `${Number(data.distance_km).toFixed(1)} km`;
+  if (cardDuration) cardDuration.textContent = `${data.duration_mins} mins`;
+  if (cardFareAmount) cardFareAmount.textContent = `₹${Math.round(Number(data.fare_inr))}`;
 
   rideCard.style.display = 'block';
   poiPillsSection.style.display = 'none';
 
-  // Clear existing map layers
-  if (routeGeoJsonLayer) {
-    map.removeLayer(routeGeoJsonLayer);
-  }
-  if (destMarker) {
-    map.removeLayer(destMarker);
-  }
+  // Google Maps Cartography
+  if (googleMap && window.google) {
+    // Clear existing route polyline
+    if (googleRoutePolyline) {
+      googleRoutePolyline.setMap(null);
+      googleRoutePolyline = null;
+    }
+    // Clear existing destination pin
+    if (googleDestMarker) {
+      googleDestMarker.setMap(null);
+      googleDestMarker = null;
+    }
 
-  // Draw Primary Blue Road Polyline (#2563eb, weight: 5)
-  if (data.route_geometry) {
-    routeGeoJsonLayer = L.geoJSON(data.route_geometry, {
-      style: {
-        color: '#2563eb',
-        weight: 5,
-        opacity: 0.9,
-        lineCap: 'round',
-        lineJoin: 'round'
-      }
-    }).addTo(map);
+    const bounds = new google.maps.LatLngBounds();
+    bounds.extend(new google.maps.LatLng(userLocation.lat, userLocation.lon));
 
-    map.fitBounds(routeGeoJsonLayer.getBounds(), { padding: [40, 40] });
-  }
+    // Draw route polyline if geometry exists
+    if (data.route_geometry && data.route_geometry.coordinates) {
+      const path = data.route_geometry.coordinates.map(pt => ({
+        lat: pt[1],
+        lng: pt[0]
+      }));
 
-  // Add Custom Coral Red Drop Pin with destination label
-  if (data.dest) {
-    const destIcon = L.divIcon({
-      className: 'custom-dest-marker',
-      html: `
-        <div class="drop-pin red">
-          <div class="drop-pin-badge">${data.destination || 'Destination'}</div>
-          <svg width="28" height="34" viewBox="0 0 24 24" fill="#ef4444" stroke="#ffffff" stroke-width="2" style="filter: drop-shadow(0 3px 6px rgba(0,0,0,0.25));">
-            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z"/>
-            <circle cx="12" cy="9" r="2.5" fill="#ffffff"/>
-          </svg>
-        </div>
-      `,
-      iconSize: [32, 44],
-      iconAnchor: [16, 34]
-    });
+      googleRoutePolyline = new google.maps.Polyline({
+        path: path,
+        geodesic: true,
+        strokeColor: '#2563eb', // Executive Primary Blue
+        strokeOpacity: 0.9,
+        strokeWeight: 5
+      });
+      googleRoutePolyline.setMap(googleMap);
 
-    destMarker = L.marker([data.dest.lat, data.dest.lon], { icon: destIcon }).addTo(map);
-    destMarker.bindPopup(`<b>${data.destination}</b><br>Fare: ₹${data.fare_inr}`).openPopup();
+      path.forEach(pt => bounds.extend(new google.maps.LatLng(pt.lat, pt.lng)));
+    }
+
+    // Add Coral Red Destination Pin
+    if (data.dest) {
+      const destPos = new google.maps.LatLng(data.dest.lat, data.dest.lon);
+      bounds.extend(destPos);
+
+      const destSvg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="42" viewBox="0 0 32 42">
+          <path d="M16 0C7.16 0 0 7.16 0 16c0 12 16 26 16 26s16-14 16-26C32 7.16 24.84 0 16 0z" fill="#ef4444"/>
+          <circle cx="16" cy="16" r="6" fill="#ffffff"/>
+        </svg>
+      `;
+
+      googleDestMarker = new google.maps.Marker({
+        position: destPos,
+        map: googleMap,
+        title: data.destination,
+        icon: {
+          url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(destSvg),
+          scaledSize: new google.maps.Size(32, 42),
+          anchor: new google.maps.Point(16, 42)
+        }
+      });
+    }
+
+    googleMap.fitBounds(bounds, { top: 50, bottom: 50, left: 50, right: 50 });
   }
 }
 
@@ -644,16 +804,16 @@ function renderBookingConfirmed(data) {
 }
 
 function handleRideCancelled() {
-  if (routeGeoJsonLayer) {
-    map.removeLayer(routeGeoJsonLayer);
-    routeGeoJsonLayer = null;
+  if (googleRoutePolyline) {
+    googleRoutePolyline.setMap(null);
+    googleRoutePolyline = null;
   }
-  if (destMarker) {
-    map.removeLayer(destMarker);
-    destMarker = null;
+  if (googleDestMarker) {
+    googleDestMarker.setMap(null);
+    googleDestMarker = null;
   }
-  poiMarkers.forEach(m => map.removeLayer(m));
-  poiMarkers = [];
+  googlePoiMarkers.forEach(m => m.setMap(null));
+  googlePoiMarkers = [];
 
   rideCard.style.display = 'none';
   bookingCard.style.display = 'none';
@@ -663,7 +823,11 @@ function handleRideCancelled() {
     liveStatusLabel.textContent = 'Voice Core Active';
   }
   appendTranscript('bot', 'Your ride has been cancelled. Where would you like to go instead?');
-  map.setView([userLocation.lat, userLocation.lon], 14);
+
+  if (googleMap) {
+    googleMap.setCenter(new google.maps.LatLng(userLocation.lat, userLocation.lon));
+    googleMap.setZoom(14);
+  }
 }
 
 function sendTextMessage(text) {
@@ -740,5 +904,5 @@ document.querySelectorAll('.lang-pill').forEach(pill => {
 
 // Initialize on page load
 window.addEventListener('DOMContentLoaded', () => {
-  initMap();
+  loadMapEngine();
 });

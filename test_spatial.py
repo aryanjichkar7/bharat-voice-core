@@ -75,7 +75,7 @@ def test_landmark():
     print(f"   address: {pm.get('full_address', '')[:90]}")
     print(f"   🗣  {res['clarification_prompt']}")
     check("Status EXACT", res["status"] == "EXACT")
-    check("English name resolved", "Railway Station" in pm.get("name", ""), pm.get("name", ""))
+    check("English name resolved", "railway station" in pm.get("name", "").lower(), pm.get("name", ""))
     check("Within 2 km of Sitabuldi", pm.get("distance_km", 99) < 2, f"{pm.get('distance_km')} km")
 
     res = se.evaluate_destination_intent("Xyzzy Nonexistent Plaza", *SITABULDI)

@@ -10,9 +10,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 
-  <!-- Leaflet CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
-
   <!-- Enterprise Mobility Stylesheet -->
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -46,10 +43,11 @@
 
       <!-- Controls Cluster: Language + GPS -->
       <div class="topbar-controls">
-        <div class="lang-selector-group">
+        <div class="lang-selector-group" id="langSelector">
           <button class="lang-pill active" data-lang="en">English</button>
           <button class="lang-pill" data-lang="hi">हिंदी</button>
           <button class="lang-pill" data-lang="mr">मराठी</button>
+          <button class="lang-pill unlinked" data-lang="gu" title="Gujarati neural voice model in development">ગુજરાતી</button>
         </div>
 
         <div class="gps-badge">
@@ -140,9 +138,22 @@
     <!-- RIGHT COLUMN: Interactive Map & Ride Telemetry (~52%) -->
     <section class="telemetry-pane">
       
-      <!-- Dedicated Map Card (height: 420px, rounded, subtle shadow) -->
+      <!-- Dedicated Map Card (Google Maps Experience) -->
       <div class="map-card-wrapper">
         <div id="map"></div>
+        <div id="mapFallbackBanner" class="map-config-banner" style="display: none;">
+          <div class="banner-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+          </div>
+          <div class="banner-text">
+            <strong>Google Maps Browser Key Required</strong>
+            <span>Set <code>GOOGLE_MAPS_BROWSER_API_KEY</code> in <code>.env</code> to activate live vector cartography.</span>
+          </div>
+        </div>
       </div>
 
       <!-- Live Trip Telemetry Card (Directly Below Map) -->
@@ -152,7 +163,7 @@
             <span class="route-indicator origin-indicator"></span>
             <div class="point-text">
               <span class="point-tag">Pickup Location</span>
-              <span class="point-name">Current Location (Nagpur GPS)</span>
+              <span class="point-name" id="cardOriginName">Current Location (Nagpur GPS)</span>
             </div>
           </div>
           <div class="route-connector-track"></div>
@@ -201,7 +212,7 @@
           <span class="eta-pill" id="driverEtaPill">3 mins away</span>
         </div>
 
-        <!-- Driver & Vehicle Card -->
+        <!-- Driver & Vehicle Card with Honest Telemetry Notice -->
         <div class="driver-summary-tile">
           <div class="driver-avatar-box">RK</div>
           <div class="driver-info-box">
@@ -210,6 +221,7 @@
               <span class="driver-rating-tag">★ 4.9</span>
             </div>
             <p class="driver-vehicle-line" id="driverVehicle">White Swift Dzire • MH 31 EQ 8421</p>
+            <p class="driver-dispatch-notice">Simulated Dispatch • Live GPS Unlinked</p>
           </div>
         </div>
 
@@ -229,8 +241,6 @@
 
   </main>
 
-  <!-- Leaflet JS -->
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <!-- Application Client Logic -->
   <script src="/static/app.js"></script>
 </body>

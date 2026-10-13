@@ -1036,3 +1036,84 @@ body.executive-body {
   70% { transform: scale(1.6); opacity: 0; }
   100% { transform: scale(1.6); opacity: 0; }
 }
+
+/* Honest Driver Dispatch Notice */
+.driver-dispatch-notice {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #94a3b8;
+  letter-spacing: 0.02em;
+  margin-top: 2px;
+}
+
+/* Map Configuration Warning Banner */
+.map-config-banner {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 16px;
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(8px);
+  border: 1px solid #fde047;
+  border-left: 4px solid #eab308;
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+  z-index: 500;
+  animation: slide-up 0.25s ease-out;
+}
+
+.map-config-banner .banner-icon {
+  color: #ca8a04;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.map-config-banner .banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.8rem;
+  color: #713f12;
+}
+
+.map-config-banner .banner-text strong {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: #854d0e;
+}
+
+.map-config-banner .banner-text code {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  background: #fef9c3;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+/* Unlinked Language Pill */
+.lang-pill.unlinked {
+  opacity: 0.55;
+  cursor: not-allowed;
+  position: relative;
+}
+
+.lang-pill.unlinked:hover::after {
+  content: "Model in dev";
+  position: absolute;
+  bottom: -24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0f172a;
+  color: #ffffff;
+  font-size: 0.65rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+

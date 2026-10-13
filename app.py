@@ -798,6 +798,17 @@ async def index():
     return FileResponse(BASE_DIR / "static" / "index.html")
 
 
+@app.get("/api/config")
+async def get_config():
+    """Return frontend configuration safely without leaking server-side secrets."""
+    return {
+        "google_maps_browser_key": os.getenv("GOOGLE_MAPS_BROWSER_API_KEY", "").strip(),
+        "default_lat": se.DEFAULT_LAT,
+        "default_lon": se.DEFAULT_LON,
+        "default_city": se.DEFAULT_CITY,
+    }
+
+
 @app.get("/health")
 async def health():
     vm = psutil.virtual_memory()
