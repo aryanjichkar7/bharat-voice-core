@@ -1,7 +1,7 @@
 /**
  * Bharat Online Cabs - Voice Assistant Client
  * Full-duplex Web Audio capture via AudioWorklet (16kHz PCM16) & streaming playback (22.05kHz PCM16).
- * Real Google Maps JavaScript API with responsive polyline, POI discovery, and honest dispatch telemetry.
+ * OpenStreetMap (Leaflet) cartography with responsive polyline, POI discovery, and honest dispatch telemetry.
  */
 
 // Configuration & Default Coordinates (Nagpur, MH)
@@ -9,6 +9,21 @@ const DEFAULT_LAT = 21.1458;
 const DEFAULT_LON = 79.0882;
 const IN_SAMPLE_RATE = 16000;
 const OUT_SAMPLE_RATE = 22050;
+
+// Session State Machine Constants
+const SESSION_STATES = {
+  READY: 'READY',
+  REQUESTING_MIC: 'REQUESTING_MIC',
+  LISTENING: 'LISTENING',
+  PROCESSING: 'PROCESSING',
+  SPEAKING: 'SPEAKING',
+  PAUSED: 'PAUSED',
+  ERROR: 'ERROR',
+  DISCONNECTED: 'DISCONNECTED',
+};
+
+const SESSION_IDLE_TIMEOUT_MS = 5000;
+const SPEECH_START_TIMEOUT_MS = 8000;
 
 // Application State
 let ws = null;
@@ -18,26 +33,126 @@ let micStream = null;
 let workletNode = null;
 let micProcessor = null; // fallback
 let isRecording = false;
+let currentSessionState = SESSION_STATES.READY;
+let orbState = SESSION_STATES.READY;
+let speechStartTimeout = null;
+let idleListeningTimeout = null;
+let processingWatchdog = null;
+let listeningCycleToken = 0;
+let lastCommittedTurnSeq = 0;
+let interimBubble = null;
 let nextPlayTime = 0;
 let activeAudioSources = [];
 let userLocation = { lat: DEFAULT_LAT, lon: DEFAULT_LON };
 let currentLanguage = 'en'; // 'en' | 'hi' | 'mr'
 
+function clearSpeechStartTimeout() {
+  if (speechStartTimeout) {
+    clearTimeout(speechStartTimeout);
+    speechStartTimeout = null;
+  }
+}
+
+function clearIdleListeningTimeout() {
+  if (idleListeningTimeout) {
+    clearTimeout(idleListeningTimeout);
+    idleListeningTimeout = null;
+  }
+}
+
+function clearProcessingWatchdog() {
+  if (processingWatchdog) {
+    clearTimeout(processingWatchdog);
+    processingWatchdog = null;
+  }
+}
+
+function clearAllTimeouts() {
+  clearSpeechStartTimeout();
+  clearIdleListeningTimeout();
+  clearProcessingWatchdog();
+}
+
+function scheduleSpeechStartTimeout(expectedCycle) {
+  clearSpeechStartTimeout();
+  speechStartTimeout = setTimeout(() => {
+    if (expectedCycle !== undefined && expectedCycle !== listeningCycleToken) {
+      console.debug(`[LIFECYCLE] Stale speechStartTimeout fired for cycle ${expectedCycle} (current: ${listeningCycleToken}), ignoring`);
+      return;
+    }
+    if (isRecording && (currentSessionState === SESSION_STATES.LISTENING || orbState === SESSION_STATES.LISTENING)) {
+      console.info(`[LIFECYCLE] ${SPEECH_START_TIMEOUT_MS}ms speech-start timeout expired: stopping capture`);
+      stopAudioCapture('SPEECH_START_TIMEOUT');
+      setOrbState(SESSION_STATES.PAUSED, 'Timed out waiting for speech');
+    }
+  }, SPEECH_START_TIMEOUT_MS);
+}
+
+function scheduleIdleListeningTimeout(expectedCycle) {
+  clearIdleListeningTimeout();
+  idleListeningTimeout = setTimeout(() => {
+    if (expectedCycle !== undefined && expectedCycle !== listeningCycleToken) {
+      console.debug(`[LIFECYCLE] Stale idleListeningTimeout fired for cycle ${expectedCycle} (current: ${listeningCycleToken}), ignoring`);
+      return;
+    }
+    if (isRecording && (currentSessionState === SESSION_STATES.LISTENING || orbState === SESSION_STATES.LISTENING)) {
+      console.info(`[LIFECYCLE] ${SESSION_IDLE_TIMEOUT_MS}ms idle listening timeout expired: stopping capture`);
+      stopAudioCapture('IDLE_TIMEOUT');
+      setOrbState(SESSION_STATES.PAUSED, 'Paused due to inactivity');
+    }
+  }, SESSION_IDLE_TIMEOUT_MS);
+}
+
+function scheduleProcessingWatchdog() {
+  clearProcessingWatchdog();
+  processingWatchdog = setTimeout(() => {
+    if (isRecording && (currentSessionState === SESSION_STATES.PROCESSING || orbState === SESSION_STATES.PROCESSING)) {
+      console.warn('[WATCHDOG] Operation timed out after 15s without server response');
+      stopAudioCapture('OPERATION_TIMEOUT');
+      clearInterimTranscript();
+      setOrbState(SESSION_STATES.ERROR, 'Search request timed out. Tap orb to retry.');
+      setTripPanelError('Search request timed out. Tap the orb to retry or specify a nearby landmark.');
+      appendTranscript('bot', "The search request timed out. Please tap the orb to try again or specify a nearby landmark.");
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'INTERRUPT_PLAYBACK' }));
+      }
+    }
+  }, 15000);
+}
+
+function enterListeningState(reason) {
+  if (!isRecording || currentRideState === 'RIDE_ACTIVE' || isBookingConfirmedPendingSpeech) {
+    console.info(`[LIFECYCLE] enterListeningState suppressed (isRecording=${isRecording}, rideState=${currentRideState}, pendingBookingSpeech=${isBookingConfirmedPendingSpeech})`);
+    return;
+  }
+  listeningCycleToken++;
+  const cycle = listeningCycleToken;
+  console.info(`[LIFECYCLE] enterListeningState (cycle=${cycle}, reason=${reason})`);
+  clearProcessingWatchdog();
+  clearSpeechStartTimeout();
+  clearIdleListeningTimeout();
+  setOrbState(SESSION_STATES.LISTENING);
+  scheduleIdleListeningTimeout(cycle);
+}
+
 let clientTurnSeq = 0;
 const renderedMsgIds = new Set();
+let lastRenderedRole = null;
+let lastRenderedText = null;
+let lastRenderedTime = 0;
+let isBookingConfirmedPendingSpeech = false;
 let isSendingText = false;
 let lastUserActivityTime = Date.now();
 let activeRideData = null;
 let currentRideState = 'IDLE'; // 'IDLE' | 'PROPOSAL' | 'RIDE_ACTIVE' | 'CANCELLED'
 
-// Google Maps State
-let googleMap = null;
-let googlePickupMarker = null;
-let googleDestMarker = null;
-let googleRoutePolyline = null;
-let googlePoiMarkers = [];
-let googleMapsLoaded = false;
-let googleMapsBrowserKey = '';
+// Leaflet OpenStreetMap State
+let leafletMap = null;
+let leafletPickupMarker = null;
+let leafletDestMarker = null;
+let leafletRoutePolyline = null;
+let leafletPoiMarkers = [];
+let mapTileUrl = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 
 // DOM Elements
 const voiceOrb = document.getElementById('voiceOrb');
@@ -74,158 +189,147 @@ const cardDuration = document.getElementById('cardDuration');
 const btnConfirmRide = document.getElementById('btnConfirmRide');
 
 const confirmedBookingId = document.getElementById('confirmedBookingId');
-const bookingOtpBadge = document.getElementById('bookingOtpBadge');
-const driverName = document.getElementById('driverName');
-const driverVehicle = document.getElementById('driverVehicle');
-const driverEtaPill = document.getElementById('driverEtaPill');
+const confirmedDistance = document.getElementById('confirmedDistance');
+const confirmedDuration = document.getElementById('confirmedDuration');
+const confirmedFare = document.getElementById('confirmedFare');
 const btnCancelRide = document.getElementById('btnCancelRide');
-const mapFallbackBanner = document.getElementById('mapFallbackBanner');
 
-// ----------------------------------------------------------------------------- 1. Google Maps Initialization
-window.gm_authFailure = function () {
-  console.warn('Google Maps authentication failure. Check GOOGLE_MAPS_BROWSER_API_KEY restrictions.');
-  if (mapFallbackBanner) {
-    mapFallbackBanner.style.display = 'flex';
-    mapFallbackBanner.querySelector('.banner-text span').innerHTML =
-      'Google Maps API Key Authentication Failed. Check API restrictions in Google Cloud Console.';
+function setTripPanelError(errorMessage) {
+  if (!cardIdleView) return;
+  const statusBadge = cardIdleView.querySelector('.trip-status-badge');
+  if (statusBadge) {
+    statusBadge.className = 'trip-status-badge badge-error';
+    statusBadge.textContent = 'Search Error';
   }
-};
+  const guidanceTitle = cardIdleView.querySelector('.guidance-text strong');
+  if (guidanceTitle) {
+    guidanceTitle.textContent = 'Search Request Timed Out';
+  }
+  const guidanceDesc = cardIdleView.querySelector('.guidance-text p');
+  if (guidanceDesc) {
+    guidanceDesc.textContent = errorMessage || 'The search service is taking longer than expected. Tap the orb to retry or specify a nearby landmark.';
+  }
+}
 
+function clearTripPanelError() {
+  if (!cardIdleView) return;
+  const statusBadge = cardIdleView.querySelector('.trip-status-badge');
+  if (statusBadge) {
+    statusBadge.className = 'trip-status-badge badge-idle';
+    statusBadge.textContent = 'Awaiting Destination';
+  }
+  const guidanceTitle = cardIdleView.querySelector('.guidance-text strong');
+  if (guidanceTitle) {
+    guidanceTitle.textContent = 'Start a Trip in Nagpur';
+  }
+  const guidanceDesc = cardIdleView.querySelector('.guidance-text p');
+  if (guidanceDesc) {
+    guidanceDesc.textContent = 'Speak your destination aloud or type below. The system will compute the road route, driving time, and fare quotation.';
+  }
+}
+
+// ----------------------------------------------------------------------------- 1. OpenStreetMap (Leaflet) Initialization
 async function loadMapEngine() {
   try {
     const res = await fetch('/api/config');
     const config = await res.json();
-    googleMapsBrowserKey = config.google_maps_browser_key || '';
+    mapTileUrl = config.map_tile_url || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 
     if (config.default_lat && config.default_lon) {
       userLocation.lat = config.default_lat;
       userLocation.lon = config.default_lon;
     }
-
-    if (googleMapsBrowserKey) {
-      loadGoogleMapsScript(googleMapsBrowserKey);
-    } else {
-      console.info('GOOGLE_MAPS_BROWSER_API_KEY not configured. Displaying setup guidance.');
-      showMapConfigBanner();
-      renderMapPlaceholder();
-    }
   } catch (err) {
     console.error('Error fetching /api/config:', err);
-    showMapConfigBanner();
-    renderMapPlaceholder();
   }
 
-  // Attempt browser GPS acquisition
+  initLeafletMap();
+
+  // Attempt browser GPS acquisition with location honesty
   if (navigator.geolocation) {
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         userLocation.lat = pos.coords.latitude;
         userLocation.lon = pos.coords.longitude;
+        userLocation.is_exact_gps = true;
         if (gpsCoordsLabel) {
           gpsCoordsLabel.textContent = `GPS (${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E)`;
         }
-        if (googleMap && googlePickupMarker) {
-          const latLng = new google.maps.LatLng(userLocation.lat, userLocation.lon);
-          googlePickupMarker.setPosition(latLng);
-          googleMap.setCenter(latLng);
+        if (leafletMap && leafletPickupMarker) {
+          leafletPickupMarker.setLatLng([userLocation.lat, userLocation.lon]);
+          leafletMap.setView([userLocation.lat, userLocation.lon]);
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'CLIENT_INIT',
+            lat: userLocation.lat,
+            lon: userLocation.lon,
+            lang: currentLanguage,
+            gps_source: 'client_exact'
+          }));
         }
       },
-      () => {
-        console.log('Using default Nagpur coordinates');
+      (err) => {
+        console.info('Using default dispatch coordinates (GPS permission not granted):', err.message);
+        userLocation.is_exact_gps = false;
+        if (gpsCoordsLabel) {
+          gpsCoordsLabel.textContent = `Dispatch Core (Approximate: ${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E)`;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'CLIENT_INIT',
+            lat: userLocation.lat,
+            lon: userLocation.lon,
+            lang: currentLanguage,
+            gps_source: 'fallback_approximate'
+          }));
+        }
       },
-      { timeout: 5000 }
+      { timeout: 7000, enableHighAccuracy: true }
     );
   }
 }
 
-function showMapConfigBanner() {
-  if (mapFallbackBanner) {
-    mapFallbackBanner.style.display = 'flex';
-  }
-}
-
-function loadGoogleMapsScript(apiKey) {
-  if (window.google && window.google.maps) {
-    initGoogleMap();
-    return;
-  }
-
-  const script = document.createElement('script');
-  script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&libraries=geometry`;
-  script.async = true;
-  script.defer = true;
-  script.onload = () => {
-    googleMapsLoaded = true;
-    initGoogleMap();
-  };
-  script.onerror = () => {
-    console.error('Failed to load Google Maps script.');
-    showMapConfigBanner();
-    renderMapPlaceholder();
-  };
-  document.head.appendChild(script);
-}
-
-function initGoogleMap() {
+function initLeafletMap() {
   const mapElement = document.getElementById('map');
-  if (!mapElement || !window.google || !window.google.maps) return;
+  if (!mapElement || typeof L === 'undefined') return;
 
-  const centerLatLng = { lat: userLocation.lat, lng: userLocation.lon };
-  googleMap = new google.maps.Map(mapElement, {
-    center: centerLatLng,
-    zoom: 14,
-    disableDefaultUI: false,
+  if (leafletMap) {
+    leafletMap.remove();
+  }
+
+  leafletMap = L.map('map', {
     zoomControl: true,
-    mapTypeControl: false,
-    streetViewControl: false,
-    fullscreenControl: false,
-    styles: [
-      { featureType: 'poi.business', stylers: [{ visibility: 'on' }] },
-      { featureType: 'transit', stylers: [{ visibility: 'on' }] }
-    ]
-  });
+    attributionControl: true
+  }).setView([userLocation.lat, userLocation.lon], 14);
 
-  // Pickup marker (Radar pin)
-  const pickupSvg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30">
-      <circle cx="15" cy="15" r="12" fill="#10b981" fill-opacity="0.25"/>
-      <circle cx="15" cy="15" r="7" fill="#10b981" stroke="#ffffff" stroke-width="2.5"/>
-    </svg>
-  `;
+  // Standard OpenStreetMap Tile Layer with visible attribution
+  L.tileLayer(mapTileUrl, {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors'
+  }).addTo(leafletMap);
 
-  googlePickupMarker = new google.maps.Marker({
-    position: centerLatLng,
-    map: googleMap,
-    title: 'Pickup Location (Nagpur)',
-    icon: {
-      url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(pickupSvg),
-      scaledSize: new google.maps.Size(30, 30),
-      anchor: new google.maps.Point(15, 15)
-    }
-  });
-
-  if (mapFallbackBanner) {
-    mapFallbackBanner.style.display = 'none';
-  }
-}
-
-function renderMapPlaceholder() {
-  const mapElement = document.getElementById('map');
-  if (!mapElement || googleMap) return;
-
-  mapElement.innerHTML = `
-    <div style="width: 100%; height: 100%; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); display: flex; flex-direction: column; align-items: center; justify-content: center; color: #94a3b8; text-align: center; padding: 24px;">
-      <div style="width: 56px; height: 56px; border-radius: 50%; background: rgba(37, 99, 235, 0.15); border: 2px solid #2563eb; display: flex; align-items: center; justify-content: center; margin-bottom: 14px;">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2">
-          <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon>
-          <line x1="8" y1="2" x2="8" y2="18"></line>
-          <line x1="16" y1="6" x2="16" y2="22"></line>
-        </svg>
+  // Pickup Marker (Green Beacon)
+  const pickupIcon = L.divIcon({
+    className: 'custom-leaflet-pickup',
+    html: `
+      <div style="position: relative; width: 28px; height: 28px;">
+        <div style="position: absolute; width: 28px; height: 28px; border-radius: 50%; background: rgba(16, 185, 129, 0.35);"></div>
+        <div style="position: absolute; top: 5px; left: 5px; width: 18px; height: 18px; border-radius: 50%; background: #10b981; border: 2.5px solid #ffffff; box-shadow: 0 2px 6px rgba(0,0,0,0.3);"></div>
       </div>
-      <h3 style="color: #f1f5f9; font-size: 1.05rem; margin-bottom: 6px;">Nagpur Mobility Grid Ready</h3>
-      <p style="font-size: 0.82rem; max-width: 320px; line-height: 1.4;">Live coordinates: ${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E.<br>Provide <code>GOOGLE_MAPS_BROWSER_API_KEY</code> in <code>.env</code> to render vector cartography.</p>
-    </div>
-  `;
+    `,
+    iconSize: [28, 28],
+    iconAnchor: [14, 14]
+  });
+
+  leafletPickupMarker = L.marker([userLocation.lat, userLocation.lon], {
+    icon: pickupIcon,
+    title: 'Pickup Location'
+  }).addTo(leafletMap);
+
+  setTimeout(() => {
+    leafletMap.invalidateSize();
+  }, 250);
 }
 
 // ----------------------------------------------------------------------------- 2. Status Handshake
@@ -260,9 +364,7 @@ function connectWebSocket() {
       return;
     }
 
-    setOrbState('connecting');
-    orbTitle.textContent = 'Connecting...';
-    orbSubtitle.textContent = 'Initializing secure voice session';
+    setOrbState(SESSION_STATES.REQUESTING_MIC, 'Initializing secure voice session');
 
     ws = new WebSocket(getWsUrl());
     ws.binaryType = 'arraybuffer';
@@ -284,15 +386,15 @@ function connectWebSocket() {
         handleServerTextMessage(event.data);
       } else if (event.data instanceof ArrayBuffer) {
         handleServerAudioBuffer(event.data);
+      } else if (event.data instanceof Blob) {
+        event.data.arrayBuffer().then(buf => handleServerAudioBuffer(buf)).catch(err => console.error('[AUDIO] Blob decoding error:', err));
       }
     };
 
     ws.onerror = (err) => {
       console.error('WebSocket Error:', err);
       setConnectionStatus(false);
-      setOrbState('error');
-      orbTitle.textContent = 'Connection Error';
-      orbSubtitle.textContent = 'Could not reach voice dispatch';
+      setOrbState(SESSION_STATES.ERROR, 'Could not reach voice dispatch');
       reject(err);
     };
 
@@ -300,9 +402,7 @@ function connectWebSocket() {
       console.log('WebSocket closed');
       setConnectionStatus(false);
       stopAudioCapture();
-      setOrbState('idle');
-      orbTitle.textContent = 'Tap to Speak';
-      orbSubtitle.textContent = 'Voice Assistant';
+      setOrbState(SESSION_STATES.DISCONNECTED, 'Voice session disconnected');
     };
   });
 }
@@ -310,7 +410,7 @@ function connectWebSocket() {
 // ----------------------------------------------------------------------------- 4. Audio Ingestion via AudioWorklet
 async function startAudioCapture() {
   try {
-    setOrbState('requesting_mic');
+    setOrbState(SESSION_STATES.REQUESTING_MIC);
     const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
     audioCaptureCtx = new AudioCtxClass();
     await audioCaptureCtx.resume();
@@ -359,7 +459,7 @@ async function startAudioCapture() {
         muteGain.connect(audioCaptureCtx.destination);
 
         isRecording = true;
-        setOrbState('listening');
+        enterListeningState('AUDIO_WORKLET_READY');
         console.info(`[AUDIO PIPELINE] AudioWorklet active at native ${audioCaptureCtx.sampleRate} Hz -> 16000 Hz`);
         return;
       } catch (workletErr) {
@@ -381,28 +481,36 @@ async function startAudioCapture() {
     source.connect(micProcessor);
     micProcessor.connect(audioCaptureCtx.destination);
     isRecording = true;
-    setOrbState('listening');
+    enterListeningState('SCRIPT_PROCESSOR_READY');
   } catch (err) {
     console.error('Microphone access error:', err);
-    setOrbState('error', 'Microphone permission denied or device unavailable');
+    setOrbState(SESSION_STATES.ERROR, 'Microphone permission denied or device unavailable');
   }
 }
 
-function stopAudioCapture() {
+function stopAudioCapture(reason) {
+  console.info(`[LIFECYCLE] stopAudioCapture called (reason: ${reason || 'unspecified'})`);
+  clearAllTimeouts();
   if (workletNode) {
-    workletNode.disconnect();
+    try { workletNode.disconnect(); } catch (e) {}
     workletNode = null;
   }
   if (micProcessor) {
-    micProcessor.disconnect();
+    try { micProcessor.disconnect(); } catch (e) {}
     micProcessor = null;
   }
   if (micStream) {
-    micStream.getTracks().forEach(track => track.stop());
+    micStream.getTracks().forEach(track => {
+      try {
+        console.info(`[LIFECYCLE] Stopping track: ${track.kind}, readyState before: ${track.readyState}`);
+        track.stop();
+        console.info(`[LIFECYCLE] readyState after: ${track.readyState}`);
+      } catch (e) {}
+    });
     micStream = null;
   }
   if (audioCaptureCtx && audioCaptureCtx.state !== 'closed') {
-    audioCaptureCtx.close();
+    try { audioCaptureCtx.close(); } catch (e) {}
     audioCaptureCtx = null;
   }
   isRecording = false;
@@ -441,9 +549,13 @@ function float32ToInt16(buffer) {
 
 // ----------------------------------------------------------------------------- 5. Audio Playback
 function handleServerAudioBuffer(arrayBuffer) {
+  clearAllTimeouts();
   if (!audioPlaybackCtx) {
     const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
     audioPlaybackCtx = new AudioCtxClass({ sampleRate: OUT_SAMPLE_RATE });
+  }
+  if (audioPlaybackCtx.state === 'suspended') {
+    audioPlaybackCtx.resume();
   }
 
   const int16 = new Int16Array(arrayBuffer);
@@ -480,15 +592,24 @@ function handleServerAudioBuffer(arrayBuffer) {
           if (workletNode) {
             workletNode.port.postMessage({ type: 'SET_PLAYBACK_MUTE', muted: false });
           }
+          if (isBookingConfirmedPendingSpeech || currentRideState === 'RIDE_ACTIVE') {
+            isBookingConfirmedPendingSpeech = false;
+            console.info('[LIFECYCLE] Speech finished after booking confirmed: terminating mic capture');
+            stopAudioCapture('BOOKING_COMPLETED_AFTER_SPEECH');
+            setOrbState(SESSION_STATES.READY, 'Booking confirmed');
+            return;
+          }
           if (isRecording) {
-            setOrbState('listening');
+            enterListeningState('PLAYBACK_COMPLETE');
+          } else {
+            setOrbState(SESSION_STATES.READY);
           }
         }
       }, 150);
     }
   };
 
-  setOrbState('speaking');
+  setOrbState(SESSION_STATES.SPEAKING);
 }
 
 function interruptPlayback() {
@@ -506,7 +627,11 @@ function interruptPlayback() {
     ws.send(JSON.stringify({ type: 'INTERRUPT_PLAYBACK' }));
   }
   if (isRecording) {
-    setOrbState('listening');
+    if (currentSessionState !== SESSION_STATES.PROCESSING && orbState !== SESSION_STATES.PROCESSING) {
+      enterListeningState('PLAYBACK_INTERRUPTED');
+    } else {
+      console.info('[LIFECYCLE] interruptPlayback: preserving active PROCESSING state');
+    }
   }
 }
 
@@ -516,9 +641,14 @@ function handleServerTextMessage(text) {
     const data = JSON.parse(text);
     console.log('Telemetry Frame:', data);
 
+    // Keep turn counter synchronized
+    if (data.turn_seq !== undefined) {
+      clientTurnSeq = Math.max(clientTurnSeq, data.turn_seq);
+    }
+
     // Drop stale frames for superseded turns unless it's a lifecycle confirmation
-    if (data.turn_seq !== undefined && data.turn_seq < clientTurnSeq && data.type !== 'CONVERSATION_CLEARED' && data.type !== 'BOOKING_CONFIRMED') {
-      console.info(`[DROPPED] Discarding obsolete server frame (${data.type}) for turn_seq ${data.turn_seq} (current: ${clientTurnSeq})`);
+    if (data.turn_seq !== undefined && data.turn_seq < lastCommittedTurnSeq && data.type !== 'CONVERSATION_CLEARED' && data.type !== 'BOOKING_CONFIRMED') {
+      console.info(`[DROPPED] Discarding obsolete server frame (${data.type}) for turn_seq ${data.turn_seq} (last committed: ${lastCommittedTurnSeq})`);
       return;
     }
 
@@ -531,9 +661,11 @@ function handleServerTextMessage(text) {
 
       case 'SESSION_READY':
         setConnectionStatus(true);
-        setOrbState('listening');
-        orbTitle.textContent = 'Listening...';
-        orbSubtitle.textContent = `Speak in ${getLangName(currentLanguage)}`;
+        if (isRecording) {
+          enterListeningState('SESSION_READY');
+        } else {
+          setOrbState(SESSION_STATES.READY);
+        }
         break;
 
       case 'LANGUAGE_CHANGED':
@@ -543,21 +675,53 @@ function handleServerTextMessage(text) {
         }
         break;
 
+      case 'INTERIM_TRANSCRIPT':
+        // Live provisional transcript rendering - updates in-place without triggering search
+        if (data.turn_seq !== undefined && data.turn_seq <= lastCommittedTurnSeq) {
+          console.debug(`[DROPPED] Discarding stale interim transcript for turn ${data.turn_seq} (last committed: ${lastCommittedTurnSeq})`);
+          return;
+        }
+        renderInterimTranscript(data.text, data.turn_seq);
+        break;
+
       case 'USER_TRANSCRIPT':
-        // Do NOT set textInput.value: preserves user draft and avoids input stuck with sent command
+        // Final transcript replaces provisional bubble cleanly
+        clearProcessingWatchdog();
+        scheduleProcessingWatchdog();
+        if (data.turn_seq) {
+          lastCommittedTurnSeq = Math.max(lastCommittedTurnSeq, data.turn_seq);
+          clientTurnSeq = Math.max(clientTurnSeq, data.turn_seq);
+        }
+        clearInterimTranscript();
         appendTranscript('user', data.text, data.msg_id, data.turn_seq);
         recordActivity();
+        setOrbState(SESSION_STATES.PROCESSING, 'Routing to destination & calculating fare...');
+        break;
+
+      case 'STT_EMPTY':
+        clearProcessingWatchdog();
+        clearInterimTranscript();
+        if (isRecording && activeAudioSources.length === 0) {
+          enterListeningState('STT_EMPTY_REARM');
+        }
         break;
 
       case 'BOT_RESPONSE':
+        clearProcessingWatchdog();
+        if (data.turn_seq) {
+          clientTurnSeq = Math.max(clientTurnSeq, data.turn_seq);
+        }
         appendTranscript('bot', data.text, data.msg_id, data.turn_seq);
         break;
 
       case 'CONVERSATION_CLEARED':
+        clearProcessingWatchdog();
+        clearInterimTranscript();
         console.info('[TELEMETRY] Conversation cleared on server:', data);
         break;
 
       case 'DESTINATION_CLEARED':
+        clearInterimTranscript();
         setTripCardState('idle');
         break;
 
@@ -568,19 +732,23 @@ function handleServerTextMessage(text) {
         break;
 
       case 'VAD_SPEECH_START':
+        clearAllTimeouts();
         recordActivity();
-        setOrbState('processing_speech');
+        setOrbState(SESSION_STATES.PROCESSING, 'Listening to speech...');
         break;
 
       case 'VAD_SPEECH_STOP':
-        setOrbState('preparing_response');
+        setOrbState(SESSION_STATES.PROCESSING, 'Finalizing response...');
+        scheduleProcessingWatchdog();
         break;
 
       case 'POI_CANDIDATES':
+        clearTripPanelError();
         renderPoiCandidates(data.candidates || []);
         break;
 
       case 'MAP_ROUTE_PREVIEW':
+        clearTripPanelError();
         renderRoutePreview(data);
         break;
 
@@ -597,9 +765,11 @@ function handleServerTextMessage(text) {
         break;
 
       case 'ERROR':
+        clearProcessingWatchdog();
         console.error('Server error:', data.error);
+        setTripPanelError(data.error);
         appendTranscript('bot', `Error: ${data.error}`, data.msg_id, data.turn_seq);
-        setOrbState('error', data.error);
+        setOrbState(SESSION_STATES.ERROR, data.error);
         break;
 
       default:
@@ -651,54 +821,133 @@ function setLanguage(lang) {
   }
 }
 
+function renderInterimTranscript(text, turnSeq) {
+  if (!text || !text.trim()) return;
+  if (turnSeq !== undefined && turnSeq <= lastCommittedTurnSeq) return;
+  const clean = text.trim();
+
+  if (!interimBubble || !interimBubble.parentNode) {
+    const oldBubble = document.getElementById('interimTranscriptBubble');
+    if (oldBubble) {
+      oldBubble.remove();
+    }
+    interimBubble = document.createElement('div');
+    interimBubble.className = 'message-bubble user interim';
+    interimBubble.id = 'interimTranscriptBubble';
+    interimBubble.dataset.turnSeq = (turnSeq !== undefined) ? turnSeq : '';
+
+    const speakerTag = document.createElement('span');
+    speakerTag.className = 'speaker-tag';
+    speakerTag.textContent = 'You (Speaking...)';
+
+    const content = document.createElement('p');
+    content.className = 'interim-text';
+    content.textContent = clean;
+
+    interimBubble.appendChild(speakerTag);
+    interimBubble.appendChild(content);
+    transcriptBox.appendChild(interimBubble);
+  } else {
+    interimBubble.dataset.turnSeq = (turnSeq !== undefined) ? turnSeq : '';
+    const content = interimBubble.querySelector('.interim-text') || interimBubble.querySelector('p');
+    if (content) {
+      content.textContent = clean;
+    }
+  }
+  transcriptBox.scrollTop = transcriptBox.scrollHeight;
+}
+
+function clearInterimTranscript() {
+  if (interimBubble && interimBubble.parentNode) {
+    interimBubble.remove();
+  }
+  interimBubble = null;
+  const oldBubble = document.getElementById('interimTranscriptBubble');
+  if (oldBubble) {
+    oldBubble.remove();
+  }
+}
+
 function setOrbState(state, detail) {
-  voiceOrb.className = `voice-orb ${state}`;
-  switch (state) {
-    case 'idle':
+  let s = (state || SESSION_STATES.READY).toString().toUpperCase();
+  if (s === 'IDLE') s = SESSION_STATES.READY;
+  if (s === 'PROCESSING_SPEECH' || s === 'PREPARING_RESPONSE') s = SESSION_STATES.PROCESSING;
+  if (s === 'PAUSED_INACTIVITY') s = SESSION_STATES.PAUSED;
+
+  currentSessionState = s;
+  orbState = s;
+
+  let cssClass = 'idle';
+  switch (s) {
+    case SESSION_STATES.READY:
+      cssClass = 'idle';
       orbTitle.textContent = 'Tap to Speak';
       orbSubtitle.textContent = 'Voice Assistant';
       break;
-    case 'requesting_mic':
+    case SESSION_STATES.REQUESTING_MIC:
+      cssClass = 'requesting_mic';
       orbTitle.textContent = 'Requesting Microphone...';
       orbSubtitle.textContent = 'Please allow microphone access in your browser';
       break;
-    case 'listening':
+    case SESSION_STATES.LISTENING:
+      cssClass = 'listening';
       orbTitle.textContent = 'Listening...';
       orbSubtitle.textContent = `Speak in ${getLangName(currentLanguage)}`;
       break;
-    case 'processing_speech':
-      orbTitle.textContent = 'Processing Speech...';
-      orbSubtitle.textContent = 'Transcribing your utterance';
+    case SESSION_STATES.PROCESSING:
+      cssClass = 'processing';
+      orbTitle.textContent = 'Processing...';
+      orbSubtitle.textContent = detail || 'Transcribing utterance & routing';
       break;
-    case 'preparing_response':
-      orbTitle.textContent = 'Routing & Quoting...';
-      orbSubtitle.textContent = 'Evaluating Nagpur destination & fare';
-      break;
-    case 'speaking':
+    case SESSION_STATES.SPEAKING:
+      cssClass = 'speaking';
       orbTitle.textContent = 'Disha Speaking...';
       orbSubtitle.textContent = 'Voice Concierge Response';
       break;
-    case 'error':
-      orbTitle.textContent = 'Audio / System Error';
-      orbSubtitle.textContent = detail || 'Microphone or connection issue';
+    case SESSION_STATES.PAUSED:
+      cssClass = 'paused';
+      orbTitle.textContent = 'Paused due to inactivity';
+      orbSubtitle.textContent = 'Tap orb to resume hands-free voice dispatch';
       break;
-    case 'disconnected':
+    case SESSION_STATES.ERROR:
+      cssClass = 'error';
+      const detailLower = (detail || '').toLowerCase();
+      if (detailLower.includes('search') || detailLower.includes('destination') || detailLower.includes('route') || detailLower.includes('map') || detailLower.includes('timed out')) {
+        orbTitle.textContent = 'Destination Search Error';
+      } else if (detailLower.includes('microphone') || detailLower.includes('audio') || detailLower.includes('device') || detailLower.includes('permission')) {
+        orbTitle.textContent = 'Microphone / Audio Error';
+      } else if (detailLower.includes('connection') || detailLower.includes('disconnect') || detailLower.includes('server')) {
+        orbTitle.textContent = 'Connection Error';
+      } else {
+        orbTitle.textContent = 'System Error';
+      }
+      orbSubtitle.textContent = detail || 'Search or connection issue';
+      break;
+    case SESSION_STATES.DISCONNECTED:
+      cssClass = 'disconnected';
       orbTitle.textContent = 'Disconnected';
       orbSubtitle.textContent = 'Tap to reconnect voice dispatch';
       break;
-    case 'paused_inactivity':
-      orbTitle.textContent = 'Paused due to inactivity';
-      orbSubtitle.textContent = 'Tap to resume hands-free voice dispatch';
-      break;
     default:
+      cssClass = 'idle';
       orbTitle.textContent = 'Voice Assistant';
       orbSubtitle.textContent = detail || 'Ready';
       break;
   }
+  voiceOrb.className = `voice-orb ${cssClass}`;
 }
 
 function appendTranscript(role, text, msgId, turnSeq) {
   if (!text || !text.trim()) return;
+  const trimmed = text.trim();
+  const now = Date.now();
+
+  // Deduplicate identical message content from same speaker within 1500ms
+  if (lastRenderedRole === role && lastRenderedText === trimmed && (now - lastRenderedTime < 1500)) {
+    console.warn(`[TRANSCRIPT] Deduplicating identical message within 1500ms: "${trimmed}"`);
+    return;
+  }
+
   if (msgId && renderedMsgIds.has(msgId)) return;
   if (turnSeq !== undefined && turnSeq < clientTurnSeq) {
     console.warn(`[TRANSCRIPT] Discarding stale transcript from turn_seq ${turnSeq} (current: ${clientTurnSeq})`);
@@ -708,6 +957,10 @@ function appendTranscript(role, text, msgId, turnSeq) {
     renderedMsgIds.add(msgId);
   }
 
+  lastRenderedRole = role;
+  lastRenderedText = trimmed;
+  lastRenderedTime = now;
+
   const bubble = document.createElement('div');
   bubble.className = `message-bubble ${role}`;
 
@@ -716,7 +969,7 @@ function appendTranscript(role, text, msgId, turnSeq) {
   speakerTag.textContent = role === 'bot' ? 'Disha (Voice Concierge)' : 'You';
 
   const content = document.createElement('p');
-  content.textContent = text.trim();
+  content.textContent = trimmed;
 
   bubble.appendChild(speakerTag);
   bubble.appendChild(content);
@@ -726,48 +979,50 @@ function appendTranscript(role, text, msgId, turnSeq) {
 }
 
 function renderPoiCandidates(candidates) {
-  if (!candidates || candidates.length <= 1) {
+  if (!candidates || candidates.length === 0) {
     poiPillsSection.style.display = 'none';
     return;
   }
 
-  // Clear previous Google Maps POI markers
-  googlePoiMarkers.forEach(m => m.setMap(null));
-  googlePoiMarkers = [];
+  // Clear previous Leaflet POI markers
+  leafletPoiMarkers.forEach(m => {
+    if (leafletMap) leafletMap.removeLayer(m);
+  });
+  leafletPoiMarkers = [];
 
-  // Plot candidate markers if Google Maps is active
-  if (googleMap && window.google) {
-    const bounds = new google.maps.LatLngBounds();
-    bounds.extend(new google.maps.LatLng(userLocation.lat, userLocation.lon));
+  // Plot candidate markers if Leaflet is active
+  if (leafletMap && typeof L !== 'undefined') {
+    const featureGroup = L.featureGroup();
+    if (leafletPickupMarker) {
+      featureGroup.addLayer(leafletPickupMarker);
+    }
 
     candidates.slice(0, 4).forEach((c, idx) => {
-      const pos = new google.maps.LatLng(c.lat, c.lon);
-      const m = new google.maps.Marker({
-        position: pos,
-        map: googleMap,
-        title: `${c.name} (${c.distance_km} km)`,
-        label: {
-          text: String(idx + 1),
-          color: '#ffffff',
-          fontWeight: '700',
-          fontSize: '12px'
-        },
-        icon: {
-          path: google.maps.SymbolPath.CIRCLE,
-          scale: 13,
-          fillColor: '#2563eb',
-          fillOpacity: 1,
-          strokeColor: '#ffffff',
-          strokeWeight: 2.5
-        }
+      const poiIcon = L.divIcon({
+        className: 'custom-leaflet-poi',
+        html: `
+          <div style="background: #2563eb; color: #ffffff; width: 26px; height: 26px; border-radius: 50%; border: 2px solid #ffffff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.35);">
+            ${idx + 1}
+          </div>
+        `,
+        iconSize: [26, 26],
+        iconAnchor: [13, 13]
       });
 
-      const infoWindow = new google.maps.InfoWindow({
-        content: `<div style="color: #0f172a; font-family: sans-serif; font-size: 13px;"><strong>${c.name}</strong><br>${c.short_address || ''}<br><span style="color: #2563eb; font-weight: 600;">${c.distance_km} km away</span></div>`
-      });
+      const m = L.marker([c.lat, c.lon], {
+        icon: poiIcon,
+        title: `${c.name} (${c.distance_km} km)`
+      }).addTo(leafletMap);
 
-      m.addListener('click', () => {
-        infoWindow.open(googleMap, m);
+      m.bindPopup(`
+        <div style="color: #0f172a; font-family: sans-serif; font-size: 13px; line-height: 1.4;">
+          <strong>${c.name}</strong><br>
+          ${c.short_address || ''}<br>
+          <span style="color: #2563eb; font-weight: 600;">${c.distance_km} km away</span>
+        </div>
+      `);
+
+      m.on('click', () => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'SELECT_POI',
@@ -779,11 +1034,15 @@ function renderPoiCandidates(candidates) {
         poiPillsSection.style.display = 'none';
       });
 
-      googlePoiMarkers.push(m);
-      bounds.extend(pos);
+      leafletPoiMarkers.push(m);
+      featureGroup.addLayer(m);
     });
 
-    googleMap.fitBounds(bounds, { top: 60, bottom: 60, left: 60, right: 60 });
+    try {
+      leafletMap.fitBounds(featureGroup.getBounds().pad(0.15));
+    } catch (e) {
+      console.warn('fitBounds error:', e);
+    }
   }
 
   // Render clickable venue chips
@@ -822,6 +1081,7 @@ function setTripCardState(state, data) {
   if (state === 'idle') {
     currentRideState = 'IDLE';
     activeRideData = null;
+    clearTripPanelError();
     if (cardIdleView) cardIdleView.style.display = 'block';
   } else if (state === 'proposal') {
     currentRideState = 'PROPOSAL';
@@ -842,9 +1102,9 @@ function recordActivity() {
 }
 
 function pauseDueToInactivity() {
-  console.info('[INACTIVITY] Pausing audio capture after 5 minutes of idle time');
-  stopAudioCapture();
-  setOrbState('paused_inactivity');
+  console.info('[INACTIVITY] Pausing audio capture after idle time');
+  stopAudioCapture('GLOBAL_INACTIVITY');
+  setOrbState(SESSION_STATES.PAUSED, 'Paused due to inactivity');
 }
 
 setInterval(() => {
@@ -858,8 +1118,10 @@ function renderRoutePreview(data) {
   recordActivity();
 
   // Clear POI search markers from map
-  googlePoiMarkers.forEach(m => m.setMap(null));
-  googlePoiMarkers = [];
+  leafletPoiMarkers.forEach(m => {
+    if (leafletMap) leafletMap.removeLayer(m);
+  });
+  leafletPoiMarkers = [];
 
   // Update Trip Summary HUD
   if (cardOriginName) cardOriginName.textContent = `Current Location (${userLocation.lat.toFixed(4)}° N, ${userLocation.lon.toFixed(4)}° E)`;
@@ -871,89 +1133,97 @@ function renderRoutePreview(data) {
   setTripCardState('proposal', data);
   poiPillsSection.style.display = 'none';
 
-  // Google Maps Cartography
-  if (googleMap && window.google) {
+  // Leaflet OpenStreetMap Cartography
+  if (leafletMap && typeof L !== 'undefined') {
     // Clear existing route polyline
-    if (googleRoutePolyline) {
-      googleRoutePolyline.setMap(null);
-      googleRoutePolyline = null;
+    if (leafletRoutePolyline) {
+      leafletMap.removeLayer(leafletRoutePolyline);
+      leafletRoutePolyline = null;
     }
     // Clear existing destination pin
-    if (googleDestMarker) {
-      googleDestMarker.setMap(null);
-      googleDestMarker = null;
+    if (leafletDestMarker) {
+      leafletMap.removeLayer(leafletDestMarker);
+      leafletDestMarker = null;
     }
 
-    const bounds = new google.maps.LatLngBounds();
-    bounds.extend(new google.maps.LatLng(userLocation.lat, userLocation.lon));
+    const featureGroup = L.featureGroup();
+    if (leafletPickupMarker) {
+      featureGroup.addLayer(leafletPickupMarker);
+    }
 
     // Draw route polyline if geometry exists
-    if (data.route_geometry && data.route_geometry.coordinates) {
-      const path = data.route_geometry.coordinates.map(pt => ({
-        lat: pt[1],
-        lng: pt[0]
-      }));
+    if (data.route_geometry && data.route_geometry.coordinates && data.route_geometry.coordinates.length > 0) {
+      // GeoJSON coordinates are [lon, lat], Leaflet expects [lat, lon]
+      const latLngs = data.route_geometry.coordinates.map(pt => [pt[1], pt[0]]);
 
-      googleRoutePolyline = new google.maps.Polyline({
-        path: path,
-        geodesic: true,
-        strokeColor: '#2563eb', // Executive Primary Blue
-        strokeOpacity: 0.9,
-        strokeWeight: 5
-      });
-      googleRoutePolyline.setMap(googleMap);
+      leafletRoutePolyline = L.polyline(latLngs, {
+        color: '#2563eb', // Executive Primary Blue
+        weight: 5,
+        opacity: 0.9,
+        lineJoin: 'round'
+      }).addTo(leafletMap);
 
-      path.forEach(pt => bounds.extend(new google.maps.LatLng(pt.lat, pt.lng)));
+      featureGroup.addLayer(leafletRoutePolyline);
     }
 
     // Add Coral Red Destination Pin
     if (data.dest) {
-      const destPos = new google.maps.LatLng(data.dest.lat, data.dest.lon);
-      bounds.extend(destPos);
-
-      const destSvg = `
-        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="42" viewBox="0 0 32 42">
-          <path d="M16 0C7.16 0 0 7.16 0 16c0 12 16 26 16 26s16-14 16-26C32 7.16 24.84 0 16 0z" fill="#ef4444"/>
-          <circle cx="16" cy="16" r="6" fill="#ffffff"/>
-        </svg>
-      `;
-
-      googleDestMarker = new google.maps.Marker({
-        position: destPos,
-        map: googleMap,
-        title: data.destination,
-        icon: {
-          url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(destSvg),
-          scaledSize: new google.maps.Size(32, 42),
-          anchor: new google.maps.Point(16, 42)
-        }
+      const destIcon = L.divIcon({
+        className: 'custom-leaflet-dest',
+        html: `
+          <svg xmlns="http://www.w3.org/2000/svg" width="30" height="38" viewBox="0 0 32 42">
+            <path d="M16 0C7.16 0 0 7.16 0 16c0 12 16 26 16 26s16-14 16-26C32 7.16 24.84 0 16 0z" fill="#ef4444"/>
+            <circle cx="16" cy="16" r="6" fill="#ffffff"/>
+          </svg>
+        `,
+        iconSize: [30, 38],
+        iconAnchor: [15, 38]
       });
+
+      leafletDestMarker = L.marker([data.dest.lat, data.dest.lon], {
+        icon: destIcon,
+        title: data.destination || 'Destination'
+      }).addTo(leafletMap);
+
+      featureGroup.addLayer(leafletDestMarker);
     }
 
-    googleMap.fitBounds(bounds, { top: 50, bottom: 50, left: 50, right: 50 });
+    try {
+      leafletMap.fitBounds(featureGroup.getBounds().pad(0.15));
+    } catch (e) {
+      console.warn('fitBounds error:', e);
+    }
   }
 }
 
 function renderBookingConfirmed(data) {
   recordActivity();
-  confirmedBookingId.textContent = data.booking_id || 'BOC-CONFIRMED';
-  if (bookingOtpBadge) {
-    bookingOtpBadge.textContent = `OTP: ${data.otp || '4821'}`;
+  if (confirmedBookingId) {
+    confirmedBookingId.textContent = data.booking_id || 'BOC-CONFIRMED';
   }
-  if (driverName && data.driver?.name) {
-    driverName.textContent = data.driver.name;
+  if (confirmedDistance) {
+    confirmedDistance.textContent = (data.distance_km != null) ? `${data.distance_km} km` : '-- km';
   }
-  if (driverVehicle && data.driver?.car) {
-    driverVehicle.textContent = `${data.driver.car} • ${data.driver.plate || 'MH 31 EQ 8421'}`;
+  if (confirmedDuration) {
+    confirmedDuration.textContent = (data.duration_mins != null) ? `${data.duration_mins} mins` : '-- mins';
   }
-  if (driverEtaPill && data.driver?.eta_mins) {
-    driverEtaPill.textContent = `${data.driver.eta_mins} mins away`;
+  if (confirmedFare) {
+    confirmedFare.textContent = (data.fare_inr != null) ? `₹${data.fare_inr}` : '₹--';
   }
 
   setTripCardState('active', data);
 
   if (liveStatusLabel) {
-    liveStatusLabel.textContent = 'Active Ride Monitoring';
+    liveStatusLabel.textContent = 'Active Simulated Ride';
+  }
+
+  // Defect 4 fix: Cleanly terminate audio capture after booking is confirmed
+  if (activeAudioSources.length > 0) {
+    isBookingConfirmedPendingSpeech = true;
+    console.info('[LIFECYCLE] Booking confirmed; waiting for confirmation speech to finish before closing mic');
+  } else {
+    stopAudioCapture('BOOKING_CONFIRMED_IMMEDIATE');
+    setOrbState(SESSION_STATES.READY, 'Booking confirmed');
   }
 
   voiceOrb.style.boxShadow = '0 0 50px rgba(16, 185, 129, 0.8)';
@@ -964,16 +1234,19 @@ function renderBookingConfirmed(data) {
 
 function handleRideCancelled() {
   recordActivity();
-  if (googleRoutePolyline) {
-    googleRoutePolyline.setMap(null);
-    googleRoutePolyline = null;
+  isBookingConfirmedPendingSpeech = false;
+  if (leafletRoutePolyline && leafletMap) {
+    leafletMap.removeLayer(leafletRoutePolyline);
+    leafletRoutePolyline = null;
   }
-  if (googleDestMarker) {
-    googleDestMarker.setMap(null);
-    googleDestMarker = null;
+  if (leafletDestMarker && leafletMap) {
+    leafletMap.removeLayer(leafletDestMarker);
+    leafletDestMarker = null;
   }
-  googlePoiMarkers.forEach(m => m.setMap(null));
-  googlePoiMarkers = [];
+  leafletPoiMarkers.forEach(m => {
+    if (leafletMap) leafletMap.removeLayer(m);
+  });
+  leafletPoiMarkers = [];
 
   setTripCardState('cancelled');
   poiPillsSection.style.display = 'none';
@@ -982,9 +1255,8 @@ function handleRideCancelled() {
     liveStatusLabel.textContent = 'Voice Core Active';
   }
 
-  if (googleMap) {
-    googleMap.setCenter(new google.maps.LatLng(userLocation.lat, userLocation.lon));
-    googleMap.setZoom(14);
+  if (leafletMap) {
+    leafletMap.setView([userLocation.lat, userLocation.lon], 14);
   }
 }
 
@@ -992,6 +1264,8 @@ function sendTextMessage(text) {
   if (!text || !text.trim() || isSendingText) return;
   isSendingText = true;
   recordActivity();
+  clearTripPanelError();
+  clearInterimTranscript();
 
   clientTurnSeq++;
   const payload = {
@@ -1015,22 +1289,31 @@ function sendTextMessage(text) {
 
 function clearConversationHistory() {
   recordActivity();
+  clearAllTimeouts();
+  clearTripPanelError();
+  clearInterimTranscript();
   interruptPlayback();
   clientTurnSeq++;
+  lastRenderedRole = null;
+  lastRenderedText = null;
+  lastRenderedTime = 0;
+  renderedMsgIds.clear();
   transcriptBox.innerHTML = '';
 
   if (currentRideState !== 'RIDE_ACTIVE') {
     setTripCardState('idle');
-    if (googleRoutePolyline) {
-      googleRoutePolyline.setMap(null);
-      googleRoutePolyline = null;
+    if (leafletRoutePolyline && leafletMap) {
+      leafletMap.removeLayer(leafletRoutePolyline);
+      leafletRoutePolyline = null;
     }
-    if (googleDestMarker) {
-      googleDestMarker.setMap(null);
-      googleDestMarker = null;
+    if (leafletDestMarker && leafletMap) {
+      leafletMap.removeLayer(leafletDestMarker);
+      leafletDestMarker = null;
     }
-    googlePoiMarkers.forEach(m => m.setMap(null));
-    googlePoiMarkers = [];
+    leafletPoiMarkers.forEach(m => {
+      if (leafletMap) leafletMap.removeLayer(m);
+    });
+    leafletPoiMarkers = [];
     poiPillsSection.style.display = 'none';
   }
 
@@ -1042,9 +1325,9 @@ function clearConversationHistory() {
   }
 
   if (isRecording) {
-    setOrbState('listening');
+    setOrbState(SESSION_STATES.LISTENING);
   } else {
-    setOrbState('idle');
+    setOrbState(SESSION_STATES.READY);
   }
   console.info(`[CLEAR] Conversation cleared (clientTurnSeq=${clientTurnSeq}, rideActive=${currentRideState === 'RIDE_ACTIVE'})`);
 }
@@ -1052,24 +1335,50 @@ function clearConversationHistory() {
 // ----------------------------------------------------------------------------- 8. Event Listeners
 voiceOrb.addEventListener('click', async () => {
   recordActivity();
-  if (voiceOrb.classList.contains('paused_inactivity')) {
+  clearAllTimeouts();
+
+  // If in ERROR state, retry cleanly without duplicating the previous turn
+  if (currentSessionState === SESSION_STATES.ERROR || orbState === SESSION_STATES.ERROR) {
+    console.info('[LIFECYCLE] User tapped orb in ERROR state -> clearing error and retrying cleanly');
+    clearTripPanelError();
+    clearInterimTranscript();
+    clientTurnSeq++;
     try {
+      await connectWebSocket();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'START_VOICE_SESSION' }));
+      }
       await startAudioCapture();
     } catch (e) {
-      console.error(e);
+      console.error('Failed to retry voice capture after error:', e);
     }
     return;
   }
-  if (!isRecording) {
+
+  // If paused due to inactivity, resume capture
+  if (currentSessionState === SESSION_STATES.PAUSED || voiceOrb.classList.contains('paused') || voiceOrb.classList.contains('paused_inactivity')) {
     try {
       await connectWebSocket();
       await startAudioCapture();
     } catch (e) {
-      console.error(e);
+      console.error('Failed to resume voice capture:', e);
+    }
+    return;
+  }
+
+  if (!isRecording) {
+    try {
+      await connectWebSocket();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'START_VOICE_SESSION' }));
+      }
+      await startAudioCapture();
+    } catch (e) {
+      console.error('Failed to start voice capture:', e);
     }
   } else {
-    stopAudioCapture();
-    if (ws) ws.close();
+    stopAudioCapture('USER_CLICK');
+    setOrbState(SESSION_STATES.READY);
   }
 });
 
@@ -1095,13 +1404,13 @@ if (btnChangeDestination) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'CHANGE_DESTINATION' }));
     }
-    if (googleRoutePolyline) {
-      googleRoutePolyline.setMap(null);
-      googleRoutePolyline = null;
+    if (leafletRoutePolyline && leafletMap) {
+      leafletMap.removeLayer(leafletRoutePolyline);
+      leafletRoutePolyline = null;
     }
-    if (googleDestMarker) {
-      googleDestMarker.setMap(null);
-      googleDestMarker = null;
+    if (leafletDestMarker && leafletMap) {
+      leafletMap.removeLayer(leafletDestMarker);
+      leafletDestMarker = null;
     }
     setTripCardState('idle');
   });
@@ -1125,7 +1434,11 @@ sendBtn.addEventListener('click', () => {
 textInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     e.preventDefault();
-    sendBtn.click();
+    const val = textInput.value;
+    if (val && val.trim()) {
+      sendTextMessage(val);
+      textInput.value = '';
+    }
   }
 });
 

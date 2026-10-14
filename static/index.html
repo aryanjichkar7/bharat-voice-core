@@ -12,6 +12,10 @@
 
   <!-- Enterprise Mobility Stylesheet -->
   <link rel="stylesheet" href="/static/style.css">
+
+  <!-- OpenStreetMap Leaflet Engine (100% Free / Open Source) -->
+  <link rel="stylesheet" href="/static/vendor/leaflet.css">
+  <script src="/static/vendor/leaflet.js"></script>
 </head>
 <body class="executive-body">
 
@@ -109,10 +113,6 @@
             <button class="feed-clear-btn" id="clearTranscriptBtn">Clear</button>
           </div>
           <div class="feed-scroll-box" id="transcriptBox">
-            <div class="message-bubble bot">
-              <span class="speaker-tag">Disha (Voice Concierge)</span>
-              <p id="initialGreetingText">Hello! Welcome to Bharat Online Cabs. Where in Nagpur would you like to go?</p>
-            </div>
           </div>
         </div>
 
@@ -138,22 +138,9 @@
     <!-- RIGHT COLUMN: Interactive Map & Ride Telemetry (~52%) -->
     <section class="telemetry-pane">
       
-      <!-- Dedicated Map Card (Google Maps Experience) -->
+      <!-- Dedicated Map Card (OpenStreetMap Leaflet Experience) -->
       <div class="map-card-wrapper">
-        <div id="map"></div>
-        <div id="mapFallbackBanner" class="map-config-banner" style="display: none;">
-          <div class="banner-icon">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="10"></circle>
-              <line x1="12" y1="8" x2="12" y2="12"></line>
-              <line x1="12" y1="16" x2="12.01" y2="16"></line>
-            </svg>
-          </div>
-          <div class="banner-text">
-            <strong>Google Maps Browser Key Required</strong>
-            <span>Set <code>GOOGLE_MAPS_BROWSER_API_KEY</code> in <code>.env</code> to activate live vector cartography.</span>
-          </div>
-        </div>
+        <div id="map" aria-label="OpenStreetMap Interactive View"></div>
       </div>
 
       <!-- Comprehensive Dynamic Trip Summary & Status Dashboard Card -->
@@ -178,7 +165,7 @@
             </div>
             <div class="guidance-text">
               <strong>Start a Trip in Nagpur</strong>
-              <p>Speak aloud e.g. <em>"Take me to Sitabuldi Fort"</em> or <em>"Haldiram"</em>, or type below. The system will compute the road route, driving time, and fare quotation.</p>
+              <p>Speak your destination aloud or type below. The system will compute the road route, driving time, and fare quotation.</p>
             </div>
           </div>
         </div>
@@ -234,45 +221,49 @@
           </div>
         </div>
 
-        <!-- STATE 3: ACTIVE RIDE MONITOR (SIMULATED DISPATCH) -->
+        <!-- STATE 3: SIMULATED BOOKING CONFIRMATION (NO LIVE DRIVER ASSIGNED) -->
         <div class="trip-subview" id="cardActiveView" style="display: none;">
           <div class="subview-header">
             <div class="hud-status-badge">
               <span class="hud-live-dot"></span>
-              <span>SIMULATED DISPATCH — NO LIVE DRIVER ASSIGNED</span>
+              <span>SIMULATED BOOKING — NO LIVE DRIVER ASSIGNED</span>
             </div>
           </div>
 
           <div class="hud-meta-row">
             <div class="hud-chips-row">
               <span class="booking-tag" id="confirmedBookingId">BOC-XXXX</span>
-              <span class="otp-pill" id="bookingOtpBadge">OTP: 4821</span>
-            </div>
-            <span class="eta-pill" id="driverEtaPill">3 mins away</span>
-          </div>
-
-          <!-- Driver & Vehicle Card with Honest Telemetry Notice -->
-          <div class="driver-summary-tile">
-            <div class="driver-avatar-box">RK</div>
-            <div class="driver-info-box">
-              <div class="driver-name-row">
-                <strong id="driverName">Rajesh Kumar</strong>
-                <span class="driver-rating-tag">★ 4.9</span>
-              </div>
-              <p class="driver-vehicle-line" id="driverVehicle">White Swift Dzire • MH 31 EQ 8421</p>
-              <p class="driver-dispatch-notice">Simulated Dispatch • Live GPS Unlinked</p>
+              <span class="booking-tag" style="background: rgba(37, 99, 235, 0.15); color: #60a5fa; border: 1px solid rgba(37, 99, 235, 0.4);">Prototype Simulation</span>
             </div>
           </div>
 
-          <!-- Voice Helper Hint -->
-          <div class="hud-helper-bar">
-            <span>💬 Say <em>"Where is my driver?"</em>, <em>"What is my OTP?"</em>, or <em>"Cancel ride"</em> anytime.</span>
+          <!-- Truthful Booking Summary -->
+          <div class="telemetry-metrics-grid" style="margin-top: 14px; margin-bottom: 14px;">
+            <div class="metric-cell">
+              <span class="metric-label">Road Distance</span>
+              <span class="metric-data" id="confirmedDistance">-- km</span>
+            </div>
+            <div class="metric-cell">
+              <span class="metric-label">Estimated Travel Time</span>
+              <span class="metric-data" id="confirmedDuration">-- mins</span>
+            </div>
+            <div class="metric-cell fare-cell">
+              <span class="metric-label">Quoted Fare</span>
+              <span class="fare-badge" id="confirmedFare">₹--</span>
+            </div>
+          </div>
+
+          <div class="idle-guidance-box" style="margin-bottom: 16px; border-left: 3px solid #f59e0b; background: rgba(245, 158, 11, 0.08);">
+            <div class="guidance-text" style="color: #cbd5e1;">
+              <strong style="color: #fbbf24;">Prototype Demonstration Notice</strong>
+              <p style="font-size: 0.8rem; line-height: 1.4; margin-top: 4px;">This ride proposal was confirmed in demo mode. No physical vehicle, driver, or live road dispatch has been assigned.</p>
+            </div>
           </div>
 
           <!-- Cancel Ride Button -->
           <button class="btn-cancel-ride-action" id="btnCancelRide">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            <span>Cancel Active Ride</span>
+            <span>Cancel Simulated Ride</span>
           </button>
         </div>
 

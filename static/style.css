@@ -376,7 +376,8 @@ body.executive-body {
   box-shadow: 0 0 25px rgba(234, 179, 8, 0.3);
 }
 
-.voice-orb.processing_speech {
+.voice-orb.processing_speech,
+.voice-orb.processing {
   background: #ecfeff;
   border-color: #06b6d4;
   box-shadow: 0 0 30px rgba(6, 182, 212, 0.35);
@@ -593,6 +594,17 @@ body.executive-body {
   color: #2563eb;
   text-transform: uppercase;
   letter-spacing: 0.02em;
+}
+
+.message-bubble.user.interim {
+  opacity: 0.85;
+  border: 1.5px dashed #3b82f6;
+  background: rgba(239, 246, 255, 0.7);
+}
+
+.message-bubble.user.interim .interim-text {
+  font-style: italic;
+  color: #1d4ed8;
 }
 
 /* Auto-Typed Speech Box & Fallback Input */
@@ -1212,6 +1224,12 @@ body.executive-body {
   color: #dc2626;
 }
 
+.badge-error {
+  background: #fef2f2;
+  border: 1px solid #f87171;
+  color: #b91c1c;
+}
+
 .idle-guidance-box {
   display: flex;
   align-items: flex-start;
@@ -1293,17 +1311,20 @@ body.executive-body {
 }
 
 /* Paused due to Inactivity Orb State */
-.voice-orb.paused_inactivity {
+.voice-orb.paused_inactivity,
+.voice-orb.paused {
   background: linear-gradient(135deg, #d97706, #b45309);
   box-shadow: 0 0 20px rgba(217, 119, 6, 0.4);
 }
 
-.voice-orb.paused_inactivity .mic-icon {
+.voice-orb.paused_inactivity .mic-icon,
+.voice-orb.paused .mic-icon {
   display: block;
   opacity: 0.8;
 }
 
-.voice-orb.paused_inactivity .sound-wave-bars {
+.voice-orb.paused_inactivity .sound-wave-bars,
+.voice-orb.paused .sound-wave-bars {
   display: none;
 }
 

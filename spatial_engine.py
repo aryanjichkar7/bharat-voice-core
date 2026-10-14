@@ -2,8 +2,7 @@
 Bharat Online Cabs - Spatial Intelligence, Disambiguation & Fare Engine.
 
 Engines:
-  * Google Places API (New) - High precision real-time POI search across Nagpur
-  * OpenStreetMap Nominatim - Autonomous local fallback when API key is unavailable
+  * OpenStreetMap Nominatim - Autonomous geocoding & POI search across Nagpur
   * OSRM Road Route & Dynamic Fare Engine - Turn-by-turn road polyline and BOC tariff
 """
 from __future__ import annotations
@@ -18,24 +17,32 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from loguru import logger
+
+from osm_indexer import get_index_stats, query_local_places
 
 # Load .env
 load_dotenv()
-GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
 
 # ----------------------------------------------------------------------------- config
-DEFAULT_CITY = "Nagpur, Maharashtra"
-DEFAULT_LAT, DEFAULT_LON = 21.1458, 79.0882
+DEFAULT_CITY = os.getenv("DEFAULT_CITY", "Nagpur, Maharashtra")
+DEFAULT_CITY_NAME = os.getenv("DEFAULT_CITY_NAME", DEFAULT_CITY.split(",")[0].strip())
+DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "21.1458"))
+DEFAULT_LON = float(os.getenv("DEFAULT_LON", "79.0882"))
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
-GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
+MAP_PROVIDER = os.getenv("MAP_PROVIDER", "osm")
+OSM_GEOCODER_URL = os.getenv("OSM_GEOCODER_URL", "https://nominatim.openstreetmap.org/search").strip()
+OSM_REVERSE_GEOCODER_URL = os.getenv("OSM_REVERSE_GEOCODER_URL", "https://nominatim.openstreetmap.org/reverse").strip()
+OSM_ROUTING_URL = os.getenv("OSM_ROUTING_URL", "http://router.project-osrm.org/route/v1/driving").strip()
+
+NOMINATIM_URL = OSM_GEOCODER_URL
+NOMINATIM_REVERSE_URL = OSM_REVERSE_GEOCODER_URL
+OSRM_URL = OSM_ROUTING_URL
 USER_AGENT = "BharatOnlineCabs/1.0"
 HTTP_HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en"}
 
-NOMINATIM_TIMEOUT_S = 6.0
-OSRM_TIMEOUT_S = 5.0
-GOOGLE_TIMEOUT_S = 7.0
+NOMINATIM_TIMEOUT_S = 3.0
+OSRM_TIMEOUT_S = 4.0
 NOMINATIM_MIN_INTERVAL_S = 1.05
 
 BASE_FARE_INR = 50.0
@@ -55,16 +62,6 @@ _rate_lock = threading.Lock()
 _last_nominatim_call = 0.0
 _search_cache: dict[tuple, list[dict]] = {}
 
-NAGPUR_LOCALITIES = (
-    "sitabuldi", "dharampeth", "dhantoli", "ramdaspeth", "civil lines", "sadar",
-    "mahal", "gandhibagh", "nandanvan", "mominpura", "manish nagar", "besa",
-    "hudkeshwar", "jaripatka", "kamptee", "itwari", "cotton market",
-    "medical square", "seminary hills", "gayatri nagar", "pratap nagar",
-    "wardha road", "trimurti nagar", "khamla", "bajaj nagar", "shankarnagar",
-    "somalwada", "ayodhya nagar", "pardi", "wadi", "hingna", "lokmat square"
-)
-
-
 # ----------------------------------------------------------------------------- geometry
 def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Haversine great-circle distance in kilometres."""
@@ -81,7 +78,7 @@ def _viewbox(lat: float, lon: float, radius_km: float) -> str:
     return f"{lon - dlon},{lat + dlat},{lon + dlon},{lat - dlat}"
 
 
-# ----------------------------------------------------------------------------- text helpers
+# ----------------------------------------------------------------------------- text helpers & similarity
 def _normalize(name: str) -> str:
     s = name.lower().replace("'s", "s").replace("’s", "s")
     return re.sub(r"[^a-z0-9\u0900-\u097f]+", "", s)
@@ -91,36 +88,195 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    """Computes Levenshtein edit distance between two strings."""
+    if len(s1) < len(s2):
+        return _levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def _phonetic_skeleton(s: str) -> str:
+    """Generates phonetic consonant skeleton for transliterated toponyms."""
+    s = s.lower().strip()
+    s = re.sub(r"c(?=[ei])", "s", s)
+    s = re.sub(r"ph", "f", s)
+    s = re.sub(r"w", "v", s)
+    s = re.sub(r"(.)\1+", r"\1", s)
+    tokens = re.findall(r"[a-z0-9]+", s)
+    res_tokens = []
+    for tok in tokens:
+        if not tok:
+            continue
+        first = tok[0]
+        rest = re.sub(r"[aeiou]", "", tok[1:])
+        res_tokens.append(first + rest)
+    return " ".join(res_tokens)
+
+
+def _token_jaccard(tokens1: list[str], tokens2: list[str]) -> float:
+    set1, set2 = set(tokens1), set(tokens2)
+    if not set1 or not set2:
+        return 0.0
+    return len(set1 & set2) / len(set1 | set2)
+
+
+def score_candidate(query: str, candidate: dict, user_lat: float, user_lon: float) -> dict:
+    """
+    Computes calibrated similarity score for a retrieved candidate place against the query.
+    Signals combined:
+    1. Name exact match and token containment.
+    2. Character SequenceMatcher ratio and Levenshtein edit distance ratio.
+    3. Generic phonetic consonant skeleton similarity.
+    4. Locality / address keyword match.
+    5. Proximity score (ensuring geographic distance does NOT override clear name match).
+    """
+    q_clean = query.lower().strip()
+    c_name = candidate.get("name", "").lower().strip()
+    c_full = candidate.get("full_address", "").lower().strip()
+    c_short = candidate.get("short_address", "").lower().strip()
+
+    q_norm = _normalize(q_clean)
+    c_norm = _normalize(c_name)
+
+    # 1. Exact match
+    if q_norm and q_norm == c_norm:
+        name_sim = 1.0
+    else:
+        seq_ratio = SequenceMatcher(None, q_norm, c_norm).ratio()
+        max_len = max(len(q_norm), len(c_norm), 1)
+        lev_dist = _levenshtein_distance(q_norm, c_norm)
+        lev_ratio = max(0.0, 1.0 - (lev_dist / max_len))
+
+        q_tokens = [t for t in re.findall(r"[a-z0-9]+", q_clean) if len(t) >= 2]
+        c_tokens = [t for t in re.findall(r"[a-z0-9]+", c_name) if len(t) >= 2]
+        jaccard = _token_jaccard(q_tokens, c_tokens)
+
+        q_skel = _phonetic_skeleton(q_clean)
+        c_skel = _phonetic_skeleton(c_name)
+        skel_match = 1.0 if (q_skel and q_skel == c_skel) else (
+            SequenceMatcher(None, q_skel, c_skel).ratio() if (q_skel and c_skel) else 0.0
+        )
+
+        containment = 1.0 if (q_norm in c_norm or c_norm in q_norm) and min(len(q_norm), len(c_norm)) >= 4 else 0.0
+
+        name_sim = max(
+            seq_ratio * 0.4 + lev_ratio * 0.3 + jaccard * 0.3,
+            skel_match * 0.85 if skel_match >= 0.80 else 0.0,
+            containment * 0.88 if containment > 0 else 0.0,
+        )
+
+    # 2. Locality similarity (if query mentions neighborhood/locality)
+    locality_sim = 0.0
+    q_tokens = [t for t in re.findall(r"[a-z0-9]+", q_clean) if len(t) >= 3]
+    for tok in q_tokens:
+        if tok in c_short or tok in c_full:
+            locality_sim = 1.0
+            break
+
+    # 3. Proximity score: max 1.0 at user location, decaying to 0 at 30km
+    dist_km = candidate.get("distance_km", 99.0)
+    prox_score = max(0.0, 1.0 - (dist_km / 30.0))
+
+    # Guard: Distance must never override a poor name match
+    if name_sim < 0.35:
+        total_score = name_sim * 0.5
+    elif name_sim >= 0.98:
+        total_score = round(0.85 * name_sim + 0.15 * prox_score, 4)
+    else:
+        total_score = round(0.70 * name_sim + 0.15 * locality_sim + 0.15 * prox_score, 4)
+
+    return {
+        "candidate": candidate,
+        "name_sim": round(name_sim, 3),
+        "locality_sim": round(locality_sim, 3),
+        "prox_score": round(prox_score, 3),
+        "total_score": total_score,
+    }
+
+
 def _query_variants(query: str) -> list[str]:
     q = " ".join(query.split())
     variants = [q]
     spaced = re.sub(r"\b([A-Z])([A-Z][a-z])", r"\1 \2", q)
     spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", spaced)
-    for v in (spaced, q.replace("-", " ")):
-        if v not in variants:
+    for v in (spaced, q.replace("-", " "), q.replace(" ", "")):
+        if v not in variants and len(v) >= 3:
             variants.append(v)
-    return variants
+    q_low = q.lower()
+
+    # 1. Soft initial 'c' before 'i' or 'e' to 's'
+    if re.match(r"^c[ie]", q_low):
+        variants.append("s" + q_low[1:])
+
+    # 2. Double consonant collapse (tt->t, dd->d, ll->l, etc.)
+    for v in list(variants):
+        dedup = re.sub(r"([b-df-hj-np-tv-z])\1+", r"\1", v)
+        if dedup not in variants:
+            variants.append(dedup)
+
+    # 3. Generic toponym transliteration alternations
+    suffix_pairs = [
+        (r"path\b", "peth"),
+        (r"peth\b", "path"),
+        (r"pet\b", "peth"),
+        (r"peth\b", "pet"),
+        (r"ch[ao]wk\b", "chauk"),
+        (r"chauk\b", "chowk"),
+        (r"rly\b", "railway"),
+        (r"railway\b", "rly"),
+        (r"pur\b", "pore"),
+        (r"pore\b", "pur"),
+    ]
+    for v in list(variants):
+        for pat, rep in suffix_pairs:
+            cand = re.sub(pat, rep, v, flags=re.IGNORECASE)
+            if cand != v and cand not in variants:
+                variants.append(cand)
+
+    # 4. Medial vowel shifts (i <-> a) when query contains generic toponym suffixes
+    toponym_pattern = re.compile(r"(?:path|peth|pur|pore|chowk|chawk|chauk|wadi|vadi|nagar|ngr)\b", re.IGNORECASE)
+    for v in list(variants):
+        if toponym_pattern.search(v):
+            for m in re.finditer(r"([b-df-hj-np-tv-z])i(?=([b-df-hj-np-tv-z]))", v, flags=re.IGNORECASE):
+                start = m.start()
+                alt = v[:start+1] + "a" + v[start+2:]
+                if alt not in variants:
+                    variants.append(alt)
+                    for pat, rep in suffix_pairs:
+                        cand = re.sub(pat, rep, alt, flags=re.IGNORECASE)
+                        if cand != alt and cand not in variants:
+                            variants.append(cand)
+
+    return variants[:4]
 
 
 def _extract_short_address(full_address: str) -> str:
     if not full_address:
         return "Nagpur"
-    lower_addr = full_address.lower()
-    for loc in NAGPUR_LOCALITIES:
-        if loc in lower_addr:
-            return loc.title()
-
     parts = [p.strip() for p in full_address.split(",") if p.strip()]
     cleaned = []
     for p in parts:
         if re.search(r"india|\d{6}|maharashtra", p, re.IGNORECASE):
             continue
-        if p.lower() in ("nagpur", "nagpur urban taluka", "nagpur rural taluka"):
+        if re.search(r"^(nagpur|nagpur urban taluka|nagpur rural taluka|nagpur city)$", p, re.IGNORECASE):
             continue
         cleaned.append(p)
     if not cleaned:
         return "Nagpur"
-    return cleaned[-1]
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return f"{cleaned[-2]}, {cleaned[-1]}" if len(cleaned) >= 2 else cleaned[0]
 
 
 def _short_address(item: dict) -> str:
@@ -142,59 +298,235 @@ def _display_name(item: dict) -> str:
     return nd.get("name:en") or item.get("name") or item.get("display_name", "").split(",")[0]
 
 
+COMMON_CATEGORIES = {
+    "restaurant", "cafe", "hospital", "clinic", "pharmacy", "bakery",
+    "petrol pump", "atm", "bank", "hotel", "supermarket", "grocery",
+    "gym", "mall", "cinema", "park", "salon", "dhaba", "bar", "pub",
+    "jewellers", "sweets", "coffee", "store", "shop"
+}
+
+DESTINATION_PATTERNS = [
+    # 1. Composite booking command patterns (booking intention + destination combined)
+    r"^(?:actually\s+)?(?:(?:can|could|would)\s+(?:you|we)\s+)?(?:please\s+)?(?:kindly\s+)?(?:book|reserve|get|call|order|arrange|find)\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+)?(?:cab|ride|taxi|car)?\s*(?:from\s+here\s+)?(?:to|for|towards|at)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
+    r"^(?:(?:i|we)\s+)?(?:would\s+like|\'?d\s+like|wanted|want|wants|need|needed|plan|planning|wish)\s+(?:to\s+)?(?:book|get|call|order|reserve|take)?\s*(?:me\s+|us\s+)?(?:a\s+)?(?:cab|ride|taxi|car)\s+(?:to|for|towards|at)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
+    r"^(?:(?:i|we)\s+)?(?:need|want|wanted|require)\s+(?:a\s+)?(?:cab|ride|taxi|car)\s+(?:to|for|towards|at)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
+
+    # 2. Transit action patterns ("take me to", "drive to", "go to", "heading to")
+    r"^(?:actually\s+)?(?:(?:can|could|would)\s+(?:you|we)\s+)?(?:please\s+)?(?:take|drive|drop|head|bring|go)\s+(?:me\s+|us\s+)?(?:off\s+)?(?:from\s+here\s+)?(?:to|at|towards)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
+    r"^(?:(?:i\s+)?(?:would\s+like|\'?d\s+like|wanted|want|wants|need|needed|have|had|got|plan|planning|wish|wishing)\s+to\s+(?:go|reach|travel|head)(?:\s+to)?|i\s+(?:am\s+)?(?:going|heading)\s+to|i\'?m\s+(?:going|heading)\s+to|heading\s+to|going\s+to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
+    r"^(?:let\'?s\s+go\s+to|go\s+to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
+    r"^(?:how\s+much\s+(?:to\s+go\s+)?to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
+    r"^(?:cab|ride|taxi)\s+(?:to|for)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
+    r"^(?:to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
+
+    # 3. Category search / inquiry patterns
+    r"^(?:can\s+you\s+)?(?:please\s+)?(?:find|search(?:\s+for)?|look(?:\s+for)?|show)\s+(?:me\s+)?(?:\b(?:a|an|the|any|some)\b\s+)?(?:good|nearby|nearest|best)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by|please))?$",
+    r"^(?:(?:i\s+(?:am\s+)?)?looking\s+for)\s+(?:\b(?:a|an|the|any|some)\b\s+)?(?:good|nearby|nearest|best)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by))?$",
+    r"^(?:is\s+there\s+(?:any|a|an)|are\s+there\s+(?:any|some))\s+(?:good|nearby|nearest)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by))?\??$",
+
+    # 4. Hindi patterns (Latin & Devanagari)
+    r"^(?:kripya\s+)?(?:koi\s+)?(?:achha\s+|najdeeki\s+|paas\s+ka\s+)?(.+?)\s+(?:dhundo|khojo|batao|dikhao)$",
+    r"^(?:mujhe|muje|humein|hume|hamko)\s+(.+?)\s+(?:jana\s+hai|chalo|le\s+chalo|pahuncha\s+do|chhod\s+do)$",
+    r"^(.+?)\s+(?:jana\s+hai|le\s+chalo|chhod\s+do|chalo|pahuncha\s+do)$",
+    r"^(?:कृपया\s+)?(?:कोई\s+)?(?:अच्छा\s+|नजदीकी\s+|पास\s+का\s+)?(.+?)\s+(?:ढूंढो|खोजो|बताओ|दिखाओ)$",
+    r"^(?:मुझे|मुजे|हमें|हमे|हमको)\s+(.+?)\s+(?:जाना\s+है|ले\s+चलो|छोड़\s+दो|पहुंचा\s+दो)$",
+    r"^(.+?)\s+(?:जाना\s+है|ले\s+चलो|छोड़\s+दो|पहुंचा\s+दो)$",
+
+    # 5. Marathi patterns (Latin & Devanagari)
+    r"^(?:mala\s+)?(?:ekhade\s+|javalche\s+)?(.+?)\s+(?:shodha|dakhva|sanga)$",
+    r"^(?:mala|aamhala)\s+(.+?)\s*(?:la|s|laa)?\s+(?:jaycha\s+ahe|jayche\s+aahe|pohachva)$",
+    r"^(.+?)\s*(?:la|s)\s+(?:jaycha\s+ahe|jayche\s+aahe|gheun\s+chala)$",
+    r"^(?:मला\s+)?(?:एखादे\s+|जवळचे\s+)?(.+?)\s+(?:शोधा|दाखवा|सांगा)$",
+    r"^(?:मला|आम्हाला)\s+(.+?)\s*(?:ला|स|कडे)?\s+(?:जायचे\s+आहे|नेऊन\s+सोडा|घेऊन\s+चला)$",
+    r"^(.+?)\s*(?:ला|स|कडे)\s+(?:जायचे\s+आहे|घेऊन\s+चला)$",
+]
+
+
+def extract_destination_entity(raw_query: str) -> str:
+    """Extract destination entity from conversational phrasing in English, Hindi, or Marathi."""
+    if not raw_query:
+        return ""
+    t = raw_query.strip().rstrip(".?!,")
+    for pat in DESTINATION_PATTERNS:
+        m = re.match(pat, t, re.IGNORECASE)
+        if m:
+            extracted = m.group(1).strip()
+            # Strip trailing Marathi postposition if attached to place name
+            if extracted.lower().endswith("la") and len(extracted) > 4:
+                extracted = extracted[:-2].strip()
+            elif extracted.endswith("ला") and len(extracted) > 2:
+                extracted = extracted[:-2].strip()
+            # Strip trailing fillers from extracted
+            extracted = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now)$", "", extracted, flags=re.IGNORECASE).strip()
+            return extracted
+
+    # Fallback heuristic: extract target of prepositional direction if conversational preamble was unparsed
+    fallback_m = re.search(r"\b(?:to|towards|reach|drop\s+(?:me\s+)?at|heading\s+for|for)\s+(?:the\s+|a\s+|an\s+)?([a-zA-Z0-9\s]{2,})$", t, re.IGNORECASE)
+    if fallback_m:
+        cand = fallback_m.group(1).strip()
+        cand = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now)$", "", cand, flags=re.IGNORECASE).strip()
+        if len(cand) >= 2 and not any(cand.lower() == w for w in ("here", "there", "it", "now", "today", "please", "me", "us")):
+            return cand
+
+    return t
+
+
+def parse_natural_intent_and_destination(raw_text: str) -> dict:
+    """
+    Parses natural language requests into structured intent, destination entity, and category.
+    Handles composite requests expressing both booking intent and destination together.
+    """
+    if not raw_text or not raw_text.strip():
+        return {"intent": "UNKNOWN", "destination": None, "category": None, "raw": ""}
+
+    t = raw_text.strip().rstrip(".?!, ")
+    t_lower = t.lower()
+
+    # 1. Check for cancellation intent
+    if any(p in t_lower for p in ("cancel", "radd", "band karo", "stop", "dont book", "don't book", "never mind")):
+        return {"intent": "CANCELLATION", "destination": None, "category": None, "raw": t}
+
+    # 2. Extract destination entity using regex & grammar extraction
+    extracted = extract_destination_entity(t)
+    cleaned_dest = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now)$", "", extracted, flags=re.IGNORECASE).strip()
+
+    # Check if text is a booking command with destination
+    has_booking_verb = bool(re.search(r"\b(?:book|reserve|get|call|arrange|order)\b", t_lower))
+    has_transit_verb = bool(re.search(r"\b(?:take|drive|drop|head|go|reach|travel)\b", t_lower))
+    has_dest_preposition = bool(re.search(r"\b(?:to|towards|reach|for|at)\s+", t_lower))
+
+    is_cat = cleaned_dest.lower() in COMMON_CATEGORIES or any(c in cleaned_dest.lower() for c in COMMON_CATEGORIES)
+
+    if (has_booking_verb or has_transit_verb) and cleaned_dest and cleaned_dest.lower() != t_lower:
+        intent = "BOOK_CAB" if has_booking_verb else "DESTINATION_SEARCH"
+        return {
+            "intent": intent,
+            "destination": cleaned_dest,
+            "category": cleaned_dest if is_cat else None,
+            "raw": t
+        }
+
+    if has_dest_preposition and cleaned_dest and len(cleaned_dest) >= 2 and cleaned_dest.lower() != t_lower:
+        return {
+            "intent": "DESTINATION_SEARCH",
+            "destination": cleaned_dest,
+            "category": cleaned_dest if is_cat else None,
+            "raw": t
+        }
+
+    return {
+        "intent": "DESTINATION_SEARCH" if len(cleaned_dest) >= 2 else "UNKNOWN",
+        "destination": cleaned_dest if len(cleaned_dest) >= 2 else None,
+        "category": cleaned_dest if is_cat else None,
+        "raw": t
+    }
+
+
 def sanitize_search_query(raw_query: str) -> str:
-    """Strips filler words and maps conversational phrasing to searchable POI terms."""
-    q = raw_query.lower().strip()
-    # Remove common speech filler phrases
-    fillers = [
-        "i would like to go to the",
-        "i would like to go to",
-        "i want to go to the",
-        "i want to go to",
-        "take me to the",
-        "take me to",
-        "shop near me",
-        "nearest",
-        "near me",
-        "nearby",
-        "any",
-        "the",
-        "please",
-    ]
-    for f in fillers:
-        q = q.replace(f, "")
+    """Strips conversational wrapper phrasing, articles, and maps synonyms to POI terms."""
+    extracted = extract_destination_entity(raw_query)
+    q = extracted.lower().strip()
+    # Strip leading generic articles/prepositions/qualifiers
+    q = re.sub(r"^(?:the|a|an|to|at|for)\s+", "", q)
+    q = re.sub(r"^(?:good|best|nearby|nearest|any|some)\s+", "", q)
+    # Strip common filler suffixes
+    q = re.sub(r"\s+(?:near\s+me|nearby|around\s+here|close\s+by|please|in\s+nagpur)$", "", q)
     q = q.strip()
 
-    # Category synonym normalization
+    # Category synonym & plural normalization
     category_map = {
+        # Dining & Food
+        "restaurants": "restaurant",
+        "restaurant": "restaurant",
+        "coffee shop": "cafe",
+        "coffee shops": "cafe",
+        "coffee": "cafe",
+        "cafes": "cafe",
+        "cafe": "cafe",
+        "bakeries": "bakery",
+        "bakery": "bakery",
+        "sweet shop": "sweets",
+        "sweet shops": "sweets",
+        "sweets": "sweets",
+        "dhaba": "dhaba",
+        "dhabas": "dhaba",
+        "bar": "bar",
+        "bars": "bar",
+        "pub": "pub",
+        "pubs": "pub",
+
+        # Medical
+        "hospitals": "hospital",
+        "hospital": "hospital",
+        "clinics": "hospital",
+        "clinic": "hospital",
+        "pharmacies": "pharmacy",
+        "pharmacy": "pharmacy",
+        "medical store": "pharmacy",
+        "medical stores": "pharmacy",
+        "chemist": "pharmacy",
+        "chemists": "pharmacy",
+        "chemist shop": "pharmacy",
+
+        # Fuel & Financial
+        "petrol pump": "petrol pump",
+        "petrol pumps": "petrol pump",
+        "gas station": "petrol pump",
+        "gas stations": "petrol pump",
+        "fuel pump": "petrol pump",
+        "fuel station": "petrol pump",
+        "atm": "atm",
+        "atms": "atm",
+        "bank": "bank",
+        "banks": "bank",
+
+        # Retail & Shopping
+        "hotels": "hotel",
+        "hotel": "hotel",
+        "supermarket": "supermarket",
+        "supermarkets": "supermarket",
+        "grocery": "grocery",
+        "groceries": "grocery",
+        "grocery store": "grocery",
+        "grocery stores": "grocery",
+        "gym": "gym",
+        "gyms": "gym",
+        "fitness center": "gym",
+        "mall": "mall",
+        "malls": "mall",
+        "shopping mall": "mall",
+        "cinema": "cinema",
+        "cinemas": "cinema",
+        "movie theater": "cinema",
+        "movie theatre": "cinema",
+        "theatre": "cinema",
+        "theater": "cinema",
+        "park": "park",
+        "parks": "park",
+        "salon": "salon",
+        "salons": "salon",
+        "parlour": "salon",
+        "parlor": "salon",
         "jewelry": "jewellers",
         "jeweller": "jewellers",
+        "jewellers": "jewellers",
         "jewellery": "jewellers",
         "jewelry farm": "jewellers",
         "jewelry shop": "jewellers",
         "jewellery shop": "jewellers",
         "jewelry store": "jewellers",
-        "coffee shop": "cafe",
-        "coffee": "cafe",
-        "cafe": "cafe",
-        "hospital": "hospital",
-        "clinic": "hospital",
-        "medical store": "pharmacy",
-        "chemist": "pharmacy",
-        "pharmacy": "pharmacy",
-        "sweet shop": "sweets",
-        "sweets": "sweets",
     }
     return category_map.get(q, q)
 
 
 # ----------------------------------------------------------------------------- OSM Nominatim Fallback
-def _nominatim(query: str, viewbox: str, limit: int = 20) -> list[dict]:
-    global _last_nominatim_call
+def _nominatim(query: str, viewbox: str, limit: int = 20, timeout: float = NOMINATIM_TIMEOUT_S) -> list[dict]:
+    global _last_nominatim_call, _last_search_meta
     with _rate_lock:
         wait = NOMINATIM_MIN_INTERVAL_S - (time.monotonic() - _last_nominatim_call)
         if wait > 0:
             time.sleep(wait)
+        t_req_start = time.monotonic()
         try:
             r = _session.get(
                 NOMINATIM_URL,
@@ -202,21 +534,109 @@ def _nominatim(query: str, viewbox: str, limit: int = 20) -> list[dict]:
                     "q": query, "format": "jsonv2", "limit": limit, "countrycodes": "in",
                     "viewbox": viewbox, "bounded": 1, "addressdetails": 1, "namedetails": 1,
                 },
-                timeout=NOMINATIM_TIMEOUT_S,
+                timeout=timeout,
             )
-            r.raise_for_status()
-            return r.json()
-        except (requests.RequestException, ValueError):
+            elapsed = time.monotonic() - t_req_start
+            _last_search_meta["provider_status"] = r.status_code
+            _last_search_meta["last_request_elapsed_s"] = elapsed
+            if r.status_code == 200:
+                _last_search_meta["provider_error"] = None
+                items = r.json()
+                logger.info(f"[OSM] Query {query!r} -> HTTP {r.status_code} in {elapsed:.2f}s ({len(items)} items)")
+                return items
+            else:
+                _last_search_meta["provider_error"] = f"Nominatim returned HTTP {r.status_code}"
+                logger.warning(f"[OSM] Query {query!r} -> HTTP {r.status_code} in {elapsed:.2f}s")
+                return []
+        except requests.exceptions.Timeout as e:
+            elapsed = time.monotonic() - t_req_start
+            _last_search_meta["provider_status"] = 504
+            _last_search_meta["provider_error"] = f"Nominatim timeout after {elapsed:.2f}s"
+            _last_search_meta["last_request_elapsed_s"] = elapsed
+            logger.warning(f"[OSM] Query {query!r} -> Timeout after {elapsed:.2f}s: {e}")
+            return []
+        except requests.exceptions.RequestException as e:
+            elapsed = time.monotonic() - t_req_start
+            status = getattr(getattr(e, "response", None), "status_code", 503)
+            _last_search_meta["provider_status"] = status
+            _last_search_meta["provider_error"] = f"Nominatim network error: {e}"
+            _last_search_meta["last_request_elapsed_s"] = elapsed
+            logger.warning(f"[OSM] Query {query!r} -> RequestException ({status}) after {elapsed:.2f}s: {e}")
+            return []
+        except ValueError as e:
+            elapsed = time.monotonic() - t_req_start
+            _last_search_meta["provider_status"] = 500
+            _last_search_meta["provider_error"] = f"Invalid JSON response: {e}"
+            _last_search_meta["last_request_elapsed_s"] = elapsed
             return []
         finally:
             _last_nominatim_call = time.monotonic()
 
 
-def _search_osm(query: str, user_lat: float, user_lon: float, radius_km: float = 15.0) -> list[dict]:
+def reverse_geocode_coordinate(lat: float, lon: float) -> dict:
+    """Reverse-geocodes a GPS pickup coordinate using OpenStreetMap reverse geocoder."""
+    global _last_nominatim_call
+    with _rate_lock:
+        wait = NOMINATIM_MIN_INTERVAL_S - (time.monotonic() - _last_nominatim_call)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = _session.get(
+                NOMINATIM_REVERSE_URL,
+                params={
+                    "lat": lat,
+                    "lon": lon,
+                    "format": "jsonv2",
+                    "addressdetails": 1,
+                },
+                timeout=NOMINATIM_TIMEOUT_S,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return {
+                "display_name": data.get("display_name", ""),
+                "short_address": _short_address(data),
+                "lat": float(data.get("lat", lat)),
+                "lon": float(data.get("lon", lon)),
+                "address": data.get("address", {}),
+            }
+        except Exception as e:
+            return {
+                "display_name": f"{lat:.4f}° N, {lon:.4f}° E, {DEFAULT_CITY_NAME}",
+                "short_address": f"{DEFAULT_CITY_NAME} Mobility Core",
+                "lat": lat,
+                "lon": lon,
+                "address": {},
+                "error": str(e),
+            }
+        finally:
+            _last_nominatim_call = time.monotonic()
+
+
+def _search_osm(query: str, user_lat: float, user_lon: float, radius_km: float = 15.0, is_category: bool = False, max_variants: int = 2) -> list[dict]:
+    t_search_start = time.monotonic()
+    search_budget_s = 4.0
     vb = _viewbox(user_lat, user_lon, radius_km)
     candidates: list[dict] = []
-    for variant in _query_variants(query):
-        for item in _nominatim(variant, vb):
+    max_candidates = 10 if is_category else 4
+
+    variants = [query] if is_category else _query_variants(query)[:max_variants]
+    for variant in variants:
+        elapsed = time.monotonic() - t_search_start
+        remaining = search_budget_s - elapsed
+        if remaining < 0.6:
+            logger.info(f"[OSM] Search budget reached (remaining={remaining:.2f}s), skipping variant {variant!r}")
+            break
+
+        req_timeout = min(NOMINATIM_TIMEOUT_S, remaining)
+        items = _nominatim(variant, vb, limit=20, timeout=req_timeout)
+
+        # If provider returned an error or timeout, do NOT attempt sequential variants
+        if _last_search_meta.get("provider_error") or _last_search_meta.get("provider_status") in (408, 429, 500, 502, 503, 504):
+            logger.warning(f"[OSM] Provider error {_last_search_meta.get('provider_status')}, breaking search loop")
+            break
+
+        for item in items:
             try:
                 lat, lon = float(item["lat"]), float(item["lon"])
             except (KeyError, ValueError):
@@ -225,6 +645,9 @@ def _search_osm(query: str, user_lat: float, user_lon: float, radius_km: float =
             if dist > radius_km:
                 continue
             name = _display_name(item)
+            is_road = item.get("type") in ("trunk", "primary", "secondary", "tertiary", "residential", "motorway")
+            if is_road and not is_category and any(_normalize(c["name"]) == _normalize(name) for c in candidates):
+                continue
             if any(_normalize(c["name"]) == _normalize(name)
                    and calculate_distance(lat, lon, c["lat"], c["lon"]) < DEDUPE_RADIUS_KM
                    for c in candidates):
@@ -240,25 +663,42 @@ def _search_osm(query: str, user_lat: float, user_lon: float, radius_km: float =
                 "rating": 4.5,
                 "importance": float(item.get("importance") or 0.0),
             })
+            if len(candidates) >= max_candidates:
+                break
+        if len(candidates) >= (5 if is_category else 2):
+            break
+
     candidates.sort(key=lambda c: c["distance_km"])
     return candidates
 
 
-def fallback_osm_search(query: str, user_lat: float, user_lon: float, radius_km: float = 15.0) -> list[dict]:
-    """Autonomous fallback to local OSM engine if Google key fails or returns no results."""
-    return _search_osm(query, user_lat, user_lon, radius_km=radius_km)
+def fallback_osm_search(query: str, user_lat: float, user_lon: float, radius_km: float = 15.0, is_category: bool = False) -> list[dict]:
+    """OSM geocoding search within local radius, bounding sequential variants to stay within processing budget."""
+    return _search_osm(query, user_lat, user_lon, radius_km=radius_km, is_category=is_category, max_variants=2)
 
 
-# ----------------------------------------------------------------------------- Google Places (New) Engine
+_last_search_meta: dict = {
+    "provider_used": "Local OpenStreetMap SQLite Engine",
+    "provider_status": 200,
+    "provider_error": None,
+    "raw_places_count": 0,
+    "filtered_places_count": 0,
+}
+
+
+# ----------------------------------------------------------------------------- OpenStreetMap Dynamic POI Engine
 def search_nearby_pois(raw_query: str, user_lat: float, user_lon: float,
                        radius_meters: float = 3000.0, radius_km: float | None = None) -> list[dict]:
     """
-    Search POIs near user coordinates.
-    Uses Google Places API (New) with circular bias and query normalization,
-    falling back to OpenStreetMap Nominatim if API key is absent or unreachable.
+    Search POIs near user coordinates using Local OpenStreetMap SQLite Engine.
+    Handles both named place resolution and business-category discovery with zero external latency.
+    Falls back gracefully if the local database is missing or unpopulated.
     """
+    global _last_search_meta
     if radius_km is not None:
         radius_meters = radius_km * 1000.0
+    effective_radius_km = max(5.0, radius_meters / 1000.0)
+
     sanitized = sanitize_search_query(raw_query)
     if not sanitized:
         return []
@@ -267,169 +707,227 @@ def search_nearby_pois(raw_query: str, user_lat: float, user_lon: float,
     if cache_key in _search_cache:
         return [dict(c) for c in _search_cache[cache_key]]
 
-    key = os.getenv("GOOGLE_PLACES_API_KEY")
+    is_cat = sanitized in COMMON_CATEGORIES or any(cat in sanitized for cat in COMMON_CATEGORIES)
 
-    if key:
-        url = "https://places.googleapis.com/v1/places:searchText"
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": key,
-            "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location,places.rating"
-        }
-        payload = {
-            "textQuery": sanitized,
-            "locationBias": {
-                "circle": {
-                    "center": {"latitude": user_lat, "longitude": user_lon},
-                    "radius": float(radius_meters)
-                }
-            }
-        }
+    # 1. Primary backend: Local OpenStreetMap SQLite Engine
+    db_stats = get_index_stats()
+    if db_stats.get("database_exists") and db_stats.get("total_rows", 0) > 0:
+        t0 = time.monotonic()
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=5)
-            data = resp.json()
-            places = data.get("places", [])
-            if places:
-                results = []
-                tokens = [w for w in re.findall(r'[a-zA-Z]{4,}', sanitized.lower())]
-                is_cat = sanitized in ("jewellers", "cafe", "pharmacy", "sweets", "hospital")
-                for p in places:
-                    p_lat = p.get("location", {}).get("latitude")
-                    p_lon = p.get("location", {}).get("longitude")
-                    if p_lat is None or p_lon is None:
-                        continue
-                    name = p.get("displayName", {}).get("text", "Destination").strip()
-                    addr = p.get("formattedAddress", "").strip()
-
-                    # For specific named queries, ensure key distinctive tokens are matched
-                    if not is_cat and tokens:
-                        matched_tokens = sum(1 for t in tokens if t in name.lower() or t in addr.lower())
-                        if matched_tokens < min(len(tokens), 2) and _similarity(sanitized, name) < 0.45:
-                            continue
-                        if "railway" in tokens and "railway" not in name.lower():
-                            continue
-
-                    dist = calculate_distance(user_lat, user_lon, p_lat, p_lon)
-                    results.append({
-                        "name": name,
-                        "full_address": addr,
-                        "short_address": _extract_short_address(addr),
-                        "lat": round(p_lat, 7),
-                        "lon": round(p_lon, 7),
-                        "distance_km": round(dist, 2),
-                        "category": "commercial/retail",
-                        "rating": p.get("rating", 4.5),
-                        "importance": 1.0,
-                    })
-
-                # Deduplicate identical pins within 200m with similar name
-                deduped = []
-                for r in results:
-                    if not any(
-                        calculate_distance(r["lat"], r["lon"], d["lat"], d["lon"]) < 0.2
-                        and _similarity(r["name"], d["name"]) > 0.6
-                        for d in deduped
-                    ):
-                        deduped.append(r)
-                results = deduped
-
-                results.sort(key=lambda x: x["distance_km"])
-                print(f"[GOOGLE PLACES] Query '{sanitized}' returned {len(results)} places near ({user_lat}, {user_lon})")
-                if results:
-                    _search_cache[cache_key] = [dict(c) for c in results]
-                    return results
+            results = query_local_places(sanitized, user_lat, user_lon, radius_km=effective_radius_km)
+            elapsed = time.monotonic() - t0
+            _last_search_meta["provider_used"] = "Local OpenStreetMap SQLite Engine"
+            _last_search_meta["provider_status"] = 200
+            _last_search_meta["provider_error"] = None
+            _last_search_meta["raw_places_count"] = len(results)
+            _last_search_meta["filtered_places_count"] = len(results)
+            _last_search_meta["last_request_elapsed_s"] = elapsed
+            logger.info(f"[Local OSM] Query {sanitized!r} -> {len(results)} items in {elapsed*1000:.1f}ms")
+            if results:
+                _search_cache[cache_key] = [dict(c) for c in results]
+            return results
         except Exception as e:
-            print(f"[GOOGLE PLACES ERROR] {e}")
+            logger.error(f"[Local OSM] Query exception: {e}")
+            _last_search_meta["provider_error"] = str(e)
+            _last_search_meta["provider_status"] = 500
+            return []
 
-    # Fallback to local OSM engine if Google key fails
-    osm_res = fallback_osm_search(sanitized, user_lat, user_lon, radius_km=max(5.0, radius_meters / 1000.0))
-    _search_cache[cache_key] = [dict(c) for c in osm_res]
-    return osm_res
+    # 2. Local database is not initialized
+    # Constraint: Do not claim local search works against an empty database.
+    allow_remote = os.getenv("ENABLE_PUBLIC_OSM_FALLBACK", "false").lower() in ("true", "1")
+    if not allow_remote:
+        logger.warning("[OSM] Local place database not initialized or empty.")
+        _last_search_meta["provider_used"] = "Local OpenStreetMap SQLite Engine"
+        _last_search_meta["provider_status"] = 503
+        _last_search_meta["provider_error"] = "Local place database not initialized. Run python import_osm_places.py to build index."
+        _last_search_meta["raw_places_count"] = 0
+        _last_search_meta["filtered_places_count"] = 0
+        return []
+
+    # 3. Optional fallback to public Nominatim only if explicitly permitted
+    _last_search_meta = {
+        "provider_used": "OpenStreetMap Nominatim Engine",
+        "provider_status": 200,
+        "provider_error": None,
+        "raw_places_count": 0,
+        "filtered_places_count": 0,
+    }
+    try:
+        results = fallback_osm_search(sanitized, user_lat, user_lon, radius_km=effective_radius_km, is_category=is_cat)
+        _last_search_meta["raw_places_count"] = len(results)
+        _last_search_meta["filtered_places_count"] = len(results)
+        if _last_search_meta.get("provider_status") == 200 and not _last_search_meta.get("provider_error"):
+            _search_cache[cache_key] = [dict(c) for c in results]
+        return results
+    except Exception as e:
+        _last_search_meta["provider_error"] = str(e)
+        _last_search_meta["provider_status"] = 500
+        return []
 
 
 # ----------------------------------------------------------------------------- Intent Evaluation
 GENERIC_CATEGORY_KEYWORDS = (
     "shop", "store", "near me", "restaurant", "cafe", "coffee", "hotel", "hospital",
-    "clinic", "atm", "any", "jewelry", "jeweller", "jewellery", "petrol pump", "dhaba",
-    "bakery", "sweet", "bar", "pharmacy", "medical"
+    "clinic", "atm", "bank", "any", "jewelry", "jeweller", "jewellery", "petrol pump",
+    "gas station", "dhaba", "bakery", "sweet", "bar", "pub", "pharmacy", "medical",
+    "supermarket", "grocery", "gym", "mall", "cinema", "park", "salon"
 )
 
 
 def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
                                 radius_km: float = 15.0) -> dict:
     """
-    Evaluates customer destination intent.
-    Handles generic categories and chain outlets with enterprise concierge phrasing.
+    Evaluates customer destination intent using candidate-grounded typo and phonetic recovery.
+    Distinguishes 5 outcomes: EXACT_MATCH, POSSIBLE_MATCH, MULTIPLE_CANDIDATES, NO_RESULTS, PROVIDER_ERROR.
     """
-    candidates = search_nearby_pois(query, user_lat, user_lon, radius_km)
+    clean_dest = extract_destination_entity(query)
+    candidates = search_nearby_pois(clean_dest, user_lat, user_lon, radius_km=radius_km)
+    meta = dict(_last_search_meta)
+
     result = {
         "status": "NOT_FOUND",
-        "query": query,
+        "resolution_type": "NO_RESULTS",
+        "query": clean_dest or query,
         "primary_match": None,
+        "suggested_match": None,
         "alternatives": [],
         "outlet_count": 0,
-        "clarification_prompt": ""
+        "clarification_prompt": "",
+        "provider_status": meta.get("provider_status", 200),
+        "provider_error": meta.get("provider_error"),
+        "confidence_score": 0.0,
     }
 
+    display_q = clean_dest if clean_dest else query
+
     if not candidates:
-        result["clarification_prompt"] = (
-            f"I couldn't find '{query}' within {radius_km:.0f} km in Nagpur. "
-            "Could you tell me a nearby landmark or specific area name?"
-        )
+        if meta.get("provider_status") in (408, 429, 403, 500, 502, 503, 504) or meta.get("provider_error"):
+            result["status"] = "PROVIDER_ERROR"
+            result["resolution_type"] = "PROVIDER_ERROR"
+            result["provider_status"] = meta.get("provider_status", 504)
+            result["provider_error"] = meta.get("provider_error") or "Map search provider timeout"
+            result["clarification_prompt"] = (
+                "Our map search service is temporarily unavailable. "
+                f"Could you specify a nearby main road or landmark in {DEFAULT_CITY_NAME} so I can route you?"
+            )
+        else:
+            result["status"] = "NOT_FOUND"
+            result["resolution_type"] = "NO_RESULTS"
+            result["provider_status"] = 200
+            result["clarification_prompt"] = (
+                f"I couldn't find '{display_q}' within {radius_km:.0f} km. "
+                "Could you tell me a nearby landmark or major road?"
+            )
         return result
 
-    nearest = candidates[0]
-    rest = candidates[1:]
-    result["outlet_count"] = len(candidates)
-    result["primary_match"] = nearest
-    result["alternatives"] = rest
+    # Score all candidates against user query
+    scored = [score_candidate(clean_dest, c, user_lat, user_lon) for c in candidates]
+    scored.sort(key=lambda s: s["total_score"], reverse=True)
+    ranked_candidates = [s["candidate"] for s in scored]
 
-    # Format human-friendly distance
-    if nearest["distance_km"] < 1.0:
-        dist_str = f"{int(nearest['distance_km'] * 1000)} meters"
+    top = scored[0]
+    top_cand = top["candidate"]
+    top_score = top["total_score"]
+    second_score = scored[1]["total_score"] if len(scored) > 1 else 0.0
+
+    result["outlet_count"] = len(ranked_candidates)
+    result["primary_match"] = top_cand
+    result["alternatives"] = ranked_candidates[1:]
+    result["confidence_score"] = top_score
+
+    # Human-friendly distance
+    if top_cand["distance_km"] < 1.0:
+        dist_str = f"{int(top_cand['distance_km'] * 1000)} meters"
     else:
-        dist_str = f"{nearest['distance_km']:.1f} kilometers"
-
-    where = f" in {nearest['short_address']}" if nearest.get("short_address") else ""
+        dist_str = f"{top_cand['distance_km']:.1f} kilometers"
+    where = f" in {top_cand['short_address']}" if top_cand.get("short_address") else ""
 
     sanitized = sanitize_search_query(query)
-    is_generic = any(w in query.lower() for w in GENERIC_CATEGORY_KEYWORDS) or sanitized in (
-        "jewellers", "cafe", "pharmacy", "sweets", "hospital"
+    is_generic = (
+        sanitized in COMMON_CATEGORIES
+        or any(cat in sanitized for cat in COMMON_CATEGORIES)
+        or any(w in query.lower() for w in GENERIC_CATEGORY_KEYWORDS)
     )
 
-    max_spread = 0.0
-    if len(candidates) > 1:
-        max_spread = max(calculate_distance(candidates[0]["lat"], candidates[0]["lon"], c["lat"], c["lon"])
-                         for c in candidates)
+    is_commercial = any(cat in top_cand.get("category", "") for cat in ("shop", "amenity", "commercial", "tourism/hotel"))
+    is_chain = (
+        is_commercial
+        and len(candidates) > 1
+        and sum(1 for c in candidates if _similarity(c["name"], top_cand["name"]) >= 0.85) >= 2
+    )
 
-    if is_generic or (len(candidates) > 1 and max_spread > 0.5):
+    if is_generic or (is_chain and top_score < 0.95):
         result["status"] = "DISAMBIGUATION_NEEDED"
-        cat_label = {
+        result["resolution_type"] = "MULTIPLE_CANDIDATES"
+        cat_label_map = {
             "jewellers": "jeweler",
             "cafe": "cafe",
             "pharmacy": "pharmacy",
             "sweets": "sweet shop",
             "hospital": "hospital",
-        }.get(sanitized, "option")
-
-        where_text = f" in {nearest['short_address']}" if nearest.get("short_address") else ""
-        if cat_label != "option":
-            result["clarification_prompt"] = (
-                f"The closest {cat_label} is {nearest['name']}{where_text}, about {dist_str} away. "
-                f"Would you like to go there, or pick another from the map?"
-            )
-        else:
-            result["clarification_prompt"] = (
-                f"The closest option is {nearest['name']}{where_text}, about {dist_str} away. "
-                f"Would you like to go there, or pick another from the map?"
-            )
+            "restaurant": "restaurant",
+            "bakery": "bakery",
+            "petrol pump": "petrol pump",
+            "atm": "ATM",
+            "bank": "bank",
+            "hotel": "hotel",
+            "supermarket": "supermarket",
+            "grocery": "grocery store",
+            "gym": "gym",
+            "mall": "shopping mall",
+            "cinema": "cinema",
+            "park": "park",
+            "salon": "salon",
+            "dhaba": "dhaba",
+            "bar": "bar",
+            "pub": "pub",
+        }
+        cat_label = cat_label_map.get(sanitized, sanitized if (sanitized in COMMON_CATEGORIES and not is_chain) else "option")
+        result["clarification_prompt"] = (
+            f"The closest {cat_label} is {top_cand['name']}{where}, about {dist_str} away. "
+            f"Would you like to go there, or pick another from the map?"
+        )
         return result
 
-    # Single unambiguous landmark
-    result["status"] = "EXACT"
-    result["clarification_prompt"] = (
-        f"Found {nearest['name']}{where}, about {dist_str} away. Shall I calculate the fare?"
-    )
+    # Low confidence -> NO_RESULTS
+    if top_score < 0.50:
+        result["status"] = "NOT_FOUND"
+        result["resolution_type"] = "NO_RESULTS"
+        result["clarification_prompt"] = (
+            f"I couldn't find '{display_q}' within {radius_km:.0f} km. "
+            "Could you tell me a nearby landmark or major road?"
+        )
+        return result
+
+    # High confidence -> EXACT_MATCH (strictly requires exact matching without typo/phonetic drift)
+    target_norm = _normalize(clean_dest)
+    top_name_norm = _normalize(top_cand["name"])
+    t_clean = re.sub(r"^the", "", target_norm)
+    c_clean = re.sub(r"^the", "", top_name_norm)
+    is_exact_name = (target_norm == top_name_norm or (bool(t_clean) and t_clean == c_clean))
+    if is_exact_name and not (len(scored) > 1 and top_score - second_score < 0.08 and second_score >= 0.80):
+        result["status"] = "EXACT"
+        result["resolution_type"] = "EXACT_MATCH"
+        result["clarification_prompt"] = (
+            f"Found {top_cand['name']}{where}, about {dist_str} away. Shall I calculate the fare?"
+        )
+        return result
+
+    # Multiple close candidates
+    if len(scored) > 1 and (top_score - second_score < 0.10) and (second_score >= 0.50):
+        result["status"] = "DISAMBIGUATION_NEEDED"
+        result["resolution_type"] = "MULTIPLE_CANDIDATES"
+        result["clarification_prompt"] = (
+            f"Found multiple options. The closest is {top_cand['name']}{where}, about {dist_str} away. "
+            "Would you like to go there, or pick another from the map?"
+        )
+        return result
+
+    # Plausible single typo / phonetic match -> POSSIBLE_MATCH
+    result["status"] = "POSSIBLE_MATCH"
+    result["resolution_type"] = "POSSIBLE_MATCH"
+    result["suggested_match"] = top_cand
+    result["clarification_prompt"] = f"Did you mean {top_cand['name']}{where}?"
     return result
 
 
@@ -442,10 +940,11 @@ def calculate_fare(distance_km: float) -> float:
 def calculate_trip_details(user_lat: float, user_lon: float, dest_lat: float, dest_lon: float,
                            destination_name: str) -> dict:
     """
-    Road route via OSRM; falls back to Haversine * 1.3 on timeout/error.
+    Road route via OSRM (OSM_ROUTING_URL).
     route_geometry is a GeoJSON LineString ([lon, lat] pairs) for the frontend map.
+    Returns honest road route, distance, duration, and fare.
+    If routing fails or is unreachable, returns a recoverable error without fabricating distance.
     """
-    source = "osrm"
     try:
         r = _session.get(
             f"{OSRM_URL}/{user_lon},{user_lat};{dest_lon},{dest_lat}",
@@ -457,24 +956,29 @@ def calculate_trip_details(user_lat: float, user_lon: float, dest_lat: float, de
         if data.get("code") != "Ok" or not data.get("routes"):
             raise ValueError(f"OSRM code={data.get('code')}")
         route = data["routes"][0]
-        distance_km = route["distance"] / 1000.0
+        distance_km = round(route["distance"] / 1000.0, 2)
         duration_mins = max(1, math.ceil(route["duration"] / 60.0))
         geometry = route["geometry"]
-    except (requests.RequestException, ValueError, KeyError):
-        source = "haversine_fallback"
-        distance_km = calculate_distance(user_lat, user_lon, dest_lat, dest_lon) * ROAD_FACTOR
-        duration_mins = max(1, math.ceil(distance_km / FALLBACK_SPEED_KMPH * 60))
-        geometry = {
-            "type": "LineString",
-            "coordinates": [[user_lon, user_lat], [dest_lon, dest_lat]]
+        return {
+            "status": "OK",
+            "destination": destination_name,
+            "dest": {"lat": dest_lat, "lon": dest_lon},
+            "distance_km": distance_km,
+            "duration_mins": int(duration_mins),
+            "fare_inr": calculate_fare(distance_km),
+            "route_geometry": geometry,
+            "route_source": "osrm",
         }
-
-    distance_km = round(distance_km, 2)
-    return {
-        "destination": destination_name,
-        "distance_km": distance_km,
-        "duration_mins": int(duration_mins),
-        "fare_inr": calculate_fare(distance_km),
-        "route_geometry": geometry,
-        "route_source": source,
-    }
+    except (requests.RequestException, ValueError, KeyError) as e:
+        return {
+            "status": "ERROR",
+            "error_code": "ROUTING_UNAVAILABLE",
+            "error_message": f"Unable to calculate driving route ({e}).",
+            "destination": destination_name,
+            "dest": {"lat": dest_lat, "lon": dest_lon},
+            "distance_km": None,
+            "duration_mins": None,
+            "fare_inr": None,
+            "route_geometry": None,
+            "route_source": "failed",
+        }
