@@ -90,7 +90,8 @@ OUT_SAMPLE_RATE = 22050          # Piper medium voices are native 22.05 kHz -> n
 VAD_STOP_SECS = 0.9               # Natural conversational pause (0.8-1.2s) before speech segment closes
 TURN_SPEECH_TIMEOUT = 0.15        # Turn-end buffer
 ALLOWED_LANGS = ("en", "hi", "mr")
-STT_HOTWORDS = "Bharat Online Cabs cab booking ride pickup destination OTP driver Nagpur"
+DEFAULT_CITY_NAME = os.getenv("DEFAULT_CITY_NAME", se.DEFAULT_CITY.split(",")[0].strip())
+STT_HOTWORDS = f"Bharat Online Cabs cab booking ride pickup destination OTP driver {DEFAULT_CITY_NAME}"
 
 VOICE_MAP = {
     "en": "en_GB-cori-medium",
@@ -99,9 +100,9 @@ VOICE_MAP = {
 }
 
 GREETINGS = {
-    "en": "Hello! Welcome to Bharat Online Cabs. Where in Nagpur would you like to go?",
-    "hi": "नमस्ते! भारत ऑनलाइन कैब्स में आपका स्वागत है। आप नागपुर में कहाँ जाना चाहेंगे?",
-    "mr": "नमस्कार! भारत ऑनलाईन कॅब्समध्ये आपले स्वागत आहे. आपण नागपूरमध्ये कुठे जाऊ इच्छिता?",
+    "en": f"Hello! Welcome to Bharat Online Cabs. Where in {DEFAULT_CITY_NAME} would you like to go?",
+    "hi": f"नमस्ते! भारत ऑनलाइन कैब्स में आपका स्वागत है। आप {DEFAULT_CITY_NAME} में कहाँ जाना चाहेंगे?",
+    "mr": f"नमस्कार! भारत ऑनलाईन कॅब्समध्ये आपले स्वागत आहे. आपण {DEFAULT_CITY_NAME}मध्ये कुठे जाऊ इच्छिता?",
 }
 
 CONFIRMATION_KEYWORDS = (
@@ -131,7 +132,7 @@ def is_confirmation_intent(text: str) -> bool:
     t = text.lower().strip()
     if is_cancellation_intent(t):
         return False
-    if any(neg in t for neg in ("don't", "dont", "no ", "nahi", "nako", "not now", "wait", "नको", "नाही", "मत")):
+    if any(neg in t for neg in ("don't", "dont", "no ", "nahi", "nako", "not now", "wait", "नको", "नाही", "मत")) or re.search(r"\bnot\b", t):
         return False
     # If the text carries a destination preposition or destination target, it is a ride request, NOT a bare confirmation
     if re.search(r"\b(?:to|towards|reach|drop\s+(?:me\s+)?at|heading\s+for)\s+[a-zA-Z0-9\u0900-\u097f]{2,}", t):
@@ -139,9 +140,21 @@ def is_confirmation_intent(text: str) -> bool:
     if any(p in t for p in ("हो", "होय", "नक्की", "करा", "बुक करा", "हाँ", "हा", "कर दो", "ठीक आहे", "ठीक है", "पुष्टी")):
         return True
     words = set(re.findall(r"\b[a-zA-Z']+\b", t))
-    if words & {"yes", "confirm", "sure", "yep", "yeah", "haan", "ha", "ho", "done", "correct", "right", "proceed"}:
+    confirm_words = {
+        "yes", "confirm", "sure", "yep", "yeah", "haan", "ha", "ho", "done",
+        "correct", "right", "proceed", "ok", "okay", "alright", "perfect",
+        "fine", "great", "chalel", "kardo", "bilkul", "zaroor"
+    }
+    if words & confirm_words:
         return True
-    if any(p in t for p in ("book it", "book this", "please book", "book cab", "book a cab", "book the cab", "confirm booking", "confirm ride", "kar do", "theek hai", "chalo", "sahi hai", "that's right", "thats right", "go ahead")):
+    confirm_phrases = (
+        "book it", "book this", "please book", "book cab", "book a cab", "book the cab",
+        "confirm booking", "confirm ride", "kar do", "theek hai", "chalo", "sahi hai",
+        "that's right", "thats right", "go ahead", "sounds good", "looks good",
+        "that works", "works for me", "let's do it", "lets do it", "let's go", "lets go",
+        "please do", "go for it", "sure thing", "all right", "ha chalel", "ho chalel"
+    )
+    if any(p in t for p in confirm_phrases):
         return True
     return bool("book" in words and "cancel" not in words and len(words) <= 5)
 
@@ -180,7 +193,7 @@ STYLE & CONSTRAINTS
 - Speak money as "rupees" (or "रुपये"), never write the ₹ symbol.
 - The customer's GPS location is already known; never ask for it.
 - Never invent places, distances, fares, driver details, or booking outcomes. Rely exclusively on verified tool outputs and session state.
-- If asked unrelated questions, politely guide the customer back to cab booking in Nagpur.
+- If asked unrelated questions, politely guide the customer back to cab booking in {DEFAULT_CITY_NAME}.
 
 BOOKING WORKFLOW & TOOLS
 1. When the customer mentions any destination or category (e.g. jewelry shop, restaurant, landmark), call search_nearby_pois with that query.
@@ -197,20 +210,32 @@ def match_candidate_choice(text: str, options: list[dict]) -> dict | None:
     t = text.lower().strip()
 
     # 1. Direct ordinals or "closest / nearest / first"
-    if any(k in t for k in ("first", "closest", "nearest", "paas", "pehla", "pehli", "option 1", "number 1", "choice 1", "first option", "1st", "1", "one")):
+    ordinal_1 = ("first", "closest", "nearest", "paas", "pehla", "pehli", "option 1", "number 1", "choice 1", "first option", "1st")
+    ordinal_2 = ("second", "dusra", "dusri", "option 2", "number 2", "choice 2", "second option", "2nd")
+    ordinal_3 = ("third", "teesra", "teesri", "option 3", "number 3", "choice 3", "third option", "3rd")
+
+    def has_ordinal(phrase: str, keys: tuple[str, ...]) -> bool:
+        for k in keys:
+            if re.search(r"\b" + re.escape(k) + r"\b", phrase):
+                return True
+        return False
+
+    if has_ordinal(t, ordinal_1) or t in ("1", "one"):
         return options[0]
-    if any(k in t for k in ("second", "dusra", "dusri", "option 2", "number 2", "choice 2", "second option", "2nd", "2", "two")) and len(options) > 1:
+    if len(options) > 1 and (has_ordinal(t, ordinal_2) or t in ("2", "two")):
         return options[1]
-    if any(k in t for k in ("third", "teesra", "teesri", "option 3", "number 3", "choice 3", "third option", "3rd", "3", "three")) and len(options) > 2:
+    if len(options) > 2 and (has_ordinal(t, ordinal_3) or t in ("3", "three")):
         return options[2]
 
     # 2. Token overlap with address or candidate name
     best_match = None
     max_score = 0
+    stop_words = {"take", "there", "please", "option", "drop", "drive", "want", "like", "would", "to"}
+    clean_words = [w for w in re.findall(r'[a-zA-Z]{3,}', t) if w not in stop_words]
     for opt in options:
         haystack = f"{opt.get('name', '')} {opt.get('short_address', '')} {opt.get('full_address', '')}".lower()
-        clean_words = re.findall(r'[a-zA-Z]{4,}', t)
-        matches = sum(1 for w in clean_words if w in haystack)
+        haystack_tokens = set(re.findall(r'[a-zA-Z0-9]+', haystack))
+        matches = sum(1 for w in clean_words if w in haystack_tokens)
         if matches > max_score:
             max_score = matches
             best_match = opt
@@ -218,14 +243,24 @@ def match_candidate_choice(text: str, options: list[dict]) -> dict | None:
     if best_match and max_score > 0:
         return best_match
 
-    # 3. Simple affirmative agreement to concierge's closest recommendation
+    # 3. Guard against explicit new destination commands (e.g. "take me to [other place]" when options don't match)
+    new_dest_match = re.search(r'\b(?:take me to|go to|drive to|drop me at|chalo)\s+(.+)', t)
+    if new_dest_match:
+        target = new_dest_match.group(1).strip()
+        if not re.search(r'^(there|that|that one|the same)\b', target):
+            return None
+
+    # 4. Simple affirmative agreement to concierge's closest recommendation
     affirmative = (
-        "yes", "ha", "haan", "sure", "ok", "okay", "chalo", "theek", "kar do",
-        "take me there", "go there", "book it", "book this", "please", "done",
-        "confirm", "let's go", "yep", "yeah", "ho", "sahi", "fine", "take me",
-        "closest", "nearest", "first"
+        "yes", "ha", "haan", "sure", "ok", "okay", "chalo", "theek", "theek hai",
+        "kar do", "take me there", "go there", "book it", "book this", "please",
+        "done", "confirm", "let's go", "yep", "yeah", "ho", "sahi", "fine",
+        "correct", "right", "agree", "proceed"
     )
-    if is_confirmation_intent(t) or any(k == t or t.startswith(k + " ") or t.endswith(" " + k) or (" " + k + " ") in t for k in affirmative):
+    if is_confirmation_intent(t) or any(
+        t == k or re.search(r"\b" + re.escape(k) + r"\b", t)
+        for k in affirmative
+    ):
         return options[0]
 
     return None
@@ -307,6 +342,8 @@ class Session:
     last_search: dict | None = None
     pending_destination: dict | None = None
     pending_ride: dict | None = None
+    proposal_id: str | None = None
+    proposal_version: int = 0
     active_ride: dict | None = None
     booking_id: str | None = None
     dispatch_mode: str = "PROTOTYPE_SIMULATION"
@@ -330,17 +367,31 @@ class Session:
         self.turn_generation += 1
         self.last_search = None
         self.pending_destination = None
-        if self.stage in ("GREETING", "DISAMBIGUATION", "DISAMBIGUATING", "AWAITING_DESTINATION_CONFIRMATION", "AWAITING_CONFIRMATION", "BOOKING_IN_PROGRESS"):
+        self.is_processing_turn = False
+        if self.stage != "RIDE_ACTIVE":
             self.stage = "AWAITING_DESTINATION"
             self.pending_ride = None
+            self.proposal_id = None
+            self.proposal_version = 0
+            self.greeting_sent = False
         return self.stage == "RIDE_ACTIVE"
 
     async def set_route_preview(self, trip: dict, dest_lat: float, dest_lon: float, push_fn=None):
-        self.pending_ride = {**trip, "dest_lat": dest_lat, "dest_lon": dest_lon}
+        self.proposal_version += 1
+        self.proposal_id = f"PROP-{uuid.uuid4().hex[:6].upper()}-v{self.proposal_version}"
+        self.pending_ride = {
+            **trip,
+            "dest_lat": dest_lat,
+            "dest_lon": dest_lon,
+            "proposal_id": self.proposal_id,
+            "proposal_version": self.proposal_version,
+        }
         self.stage = "AWAITING_CONFIRMATION"
         if push_fn:
             await push_fn(ui_message({
                 "type": "MAP_ROUTE_PREVIEW",
+                "proposal_id": self.proposal_id,
+                "proposal_version": self.proposal_version,
                 "destination": trip["destination"],
                 "distance_km": trip["distance_km"],
                 "duration_mins": trip["duration_mins"],
@@ -362,23 +413,27 @@ class Session:
             if not self.booking_id:
                 self.booking_id = f"BOC-{uuid.uuid4().hex[:6].upper()}"
             self.stage = "RIDE_ACTIVE"
+            confirmed_ride = dict(self.pending_ride)
             self.active_ride = {
-                **self.pending_ride,
+                **confirmed_ride,
                 "booking_id": self.booking_id,
                 "status": "SIMULATED_CONFIRMED",
                 "dispatch_mode": "PROTOTYPE_SIMULATION",
                 "is_live_dispatch": False,
                 "confirmed_at": time.time(),
             }
+            # Clear pending proposal so it cannot be double-confirmed
+            self.pending_ride = None
             if push_fn:
-                ride = self.pending_ride
                 await push_fn(ui_message({
                     "type": "BOOKING_CONFIRMED",
                     "booking_id": self.booking_id,
-                    "destination": ride["destination"],
-                    "fare_inr": ride["fare_inr"],
-                    "distance_km": ride["distance_km"],
-                    "duration_mins": ride["duration_mins"],
+                    "destination": confirmed_ride["destination"],
+                    "fare_inr": confirmed_ride["fare_inr"],
+                    "distance_km": confirmed_ride["distance_km"],
+                    "duration_mins": confirmed_ride["duration_mins"],
+                    "proposal_id": confirmed_ride.get("proposal_id"),
+                    "proposal_version": confirmed_ride.get("proposal_version"),
                     "dispatch_mode": "PROTOTYPE_SIMULATION",
                     "is_live_dispatch": False,
                     "turn_id": self.current_turn_id,
@@ -393,7 +448,14 @@ class Session:
             self.stage = "AWAITING_DESTINATION"
             self.active_ride = None
             self.pending_ride = None
+            self.proposal_id = None
+            self.proposal_version = 0
             self.booking_id = None
+            self.pending_destination = None
+            self.last_search = None
+            self.greeting_sent = False
+            self.is_processing_turn = False
+            self.turn_generation += 1
             if push_fn:
                 await push_fn(ui_message({
                     "type": "RIDE_CANCELLED",
@@ -469,6 +531,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
         self._model = get_whisper_model()
         self._interim_model = get_interim_whisper_model()
         self._interim_task: asyncio.Task | None = None
+        self._speech_start_time: float = 0.0
         self._last_interim_time: float = 0.0
         self._last_interim_text: str = ""
         self._active_utterance_seq: int = 0
@@ -495,6 +558,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
             logger.debug(f"[{self.session.session_id}] Discarding speech start during active turn processing")
             return
         await super()._handle_user_started_speaking(frame)
+        self._speech_start_time = time.time()
         self._last_interim_time = time.time()
         self._last_interim_text = ""
         self._active_utterance_seq = self.session.turn_generation + 1
@@ -502,6 +566,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
 
     async def _handle_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         self._active_utterance_seq = 0
+        self._last_interim_text = ""
         if self._interim_task and not self._interim_task.done():
             self._interim_task.cancel()
             self._interim_task = None
@@ -546,6 +611,14 @@ class MultilingualWhisperSTT(SegmentedSTTService):
 
         if self._user_speaking and not self.session.is_bot_speaking and not getattr(self.session, "is_processing_turn", False):
             now = time.time()
+            speech_dur = now - getattr(self, "_speech_start_time", now)
+            if speech_dur >= 5.0:
+                logger.info(f"[{self.session.session_id}] Speech duration exceeded max duration ({speech_dur:.2f}s), forcing speech stop")
+                stop_frame = VADUserStoppedSpeakingFrame()
+                await self.push_frame(stop_frame, direction)
+                await self._handle_user_stopped_speaking(stop_frame)
+                return
+
             if (now - self._last_interim_time >= 0.35) and (self._interim_task is None or self._interim_task.done()):
                 self._last_interim_time = now
                 curr_buffer = bytes(self._audio_buffer)
@@ -554,7 +627,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
     def _transcribe(self, audio: np.ndarray, biased_lang: str) -> tuple[str, str, float]:
         lang = biased_lang if biased_lang in ALLOWED_LANGS else "en"
         initial_prompt = (
-            "Bharat Online Cabs ride booking in Nagpur, Maharashtra. "
+            f"Bharat Online Cabs ride booking in {se.DEFAULT_CITY}. "
             "Taking customer to destination, landmark, area, shop, hotel, hospital, or railway station."
         )
         segments, _ = self._model.transcribe(
@@ -579,6 +652,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
 
         audio_f32 = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
         if audio_f32.size < IN_SAMPLE_RATE * 0.20:
+            self._last_interim_text = ""
             await self.push_frame(ui_message({
                 "type": "STT_EMPTY",
                 "turn_id": self.session.current_turn_id or "turn-init",
@@ -612,6 +686,7 @@ class MultilingualWhisperSTT(SegmentedSTTService):
         ))
 
         if not text or is_hallucination:
+            self._last_interim_text = ""
             if is_hallucination:
                 logger.info(f"Filtered Whisper ghost hallucination: {text!r}")
             else:
@@ -622,6 +697,8 @@ class MultilingualWhisperSTT(SegmentedSTTService):
                 "turn_seq": self.session.turn_generation,
             }))
             return
+
+        self._last_interim_text = ""
 
         # Stage 4: Raw STT output
         TurnTracer.trace(4, "RAW_STT", self.session.session_id, turn_ref,
@@ -639,6 +716,10 @@ class MultilingualWhisperSTT(SegmentedSTTService):
 class BharatSerializer(FrameSerializer):
     """Raw PCM binary frames for audio, JSON text frames for control/telemetry."""
 
+    def __init__(self, session=None):
+        super().__init__()
+        self.session = session
+
     async def serialize(self, frame: Frame) -> str | bytes | None:
         if isinstance(frame, OutputAudioRawFrame):
             return frame.audio
@@ -647,6 +728,8 @@ class BharatSerializer(FrameSerializer):
                 return None
             return json.dumps(frame.message, ensure_ascii=False)
         if isinstance(frame, InterruptionFrame):
+            if self.session and not getattr(self.session, "is_bot_speaking", False):
+                return None
             return json.dumps({"type": "INTERRUPT"})
         return None
 
@@ -733,19 +816,21 @@ class SessionController(FrameProcessor):
 
     async def _confirm_current_booking(self):
         """Deterministically confirm booking, emit BOOKING_CONFIRMED, and speak confirmation."""
+        ride = dict(self.session.pending_ride) if self.session.pending_ride else (self.session.active_ride or {})
         bid = await self.session.confirm_booking(self.push_frame)
-        if not bid or not self.session.pending_ride:
+        if not bid or not ride:
             return
-        dest = self.session.pending_ride["destination"]
-        logger.info(f"[{self.session.session_id}] Deterministic booking confirmed -> {bid} ({dest})")
+        dest = ride.get("destination", "your destination")
+        fare = round(ride.get("fare_inr", 0))
+        logger.info(f"[{self.session.session_id}] Deterministic booking confirmed -> {bid} ({dest}, ₹{fare})")
 
         lang = self.session.language
         if lang == "hi":
-            spoken = f"{dest} के लिए आपकी डेमो बुकिंग संदर्भ {bid} के साथ दर्ज हो गई है। कृपया ध्यान दें कि यह एक सिमुलेशन प्रोटोटाइप है, कोई वास्तविक ड्राइवर असाइन नहीं है।"
+            spoken = f"{dest} के लिए आपकी डेमो बुकिंग {fare} रुपये में संदर्भ {bid} के साथ दर्ज हो गई है। कृपया ध्यान दें कि यह एक सिमुलेशन प्रोटोटाइप है, कोई वास्तविक ड्राइवर असाइन नहीं है।"
         elif lang == "mr":
-            spoken = f"{dest} साठी आपली डेमो बुकिंग संदर्भ {bid} सह नोंदवली गेली आहे. कृपया लक्षात घ्या की हे केवळ सिम्युलेशन प्रोटोटाइप आहे, प्रत्यक्ष ड्रायव्हर उपलब्ध नाही."
+            spoken = f"{dest} साठी आपली डेमो बुकिंग {fare} रुपयांमध्ये संदर्भ {bid} सह नोंदवली गेली आहे. कृपया लक्षात घ्या की हे केवळ सिम्युलेशन प्रोटोटाइप आहे, प्रत्यक्ष ड्रायव्हर उपलब्ध नाही."
         else:
-            spoken = f"Your demo booking to {dest} is recorded with reference {bid}. Please note this is a simulation prototype and no live driver has been dispatched."
+            spoken = f"Your demo booking to {dest} for {fare} rupees is recorded with reference {bid}. Please note this is a simulation prototype and no live driver has been dispatched."
 
         await self.push_frame(TTSSpeakFrame(spoken))
         await self.push_frame(ui_message({
@@ -763,40 +848,24 @@ class SessionController(FrameProcessor):
 
         # Stage 6: Intent classification
         parsed_intent = se.parse_natural_intent_and_destination(text)
-        intent_type = "UNKNOWN"
+        intent_type = parsed_intent.get("intent", "UNKNOWN")
+        words = set(re.findall(r"\b[a-zA-Z']+\b", t))
         if is_cancellation_intent(text):
             intent_type = "CANCELLATION"
         elif is_confirmation_intent(text):
             intent_type = "CONFIRMATION"
-        elif parsed_intent.get("intent") in ("BOOK_CAB", "DESTINATION_SEARCH") and parsed_intent.get("destination"):
-            intent_type = "DESTINATION_SEARCH"
-        elif any(t.startswith(w) for w in ("hello", "hi", "hey", "namaste", "namaskar", "good morning", "good evening")):
+        elif any(t.startswith(w) for w in ("hello", "hi", "hey", "namaste", "namaskar", "good morning", "good evening")) and len(words) <= 3:
             intent_type = "GREETING"
-        elif any(k in t for k in ("where", "driver", "when", "kahan", "kitna time", "arrival", "cab", "otp", "pin")):
+        elif any(k in t for k in ("where is", "driver", "kitna time", "arrival time", "otp", "pin")):
             intent_type = "RIDE_STATUS_QUERY"
-        else:
+        elif parsed_intent.get("intent") == "GENERAL_QUERY":
+            intent_type = "GENERAL_QUERY"
+        elif parsed_intent.get("destination"):
             intent_type = "DESTINATION_SEARCH"
         TurnTracer.trace(6, "INTENT_CLASSIFICATION", self.session.session_id, self.session.current_turn_id or "turn-000",
                          intent=intent_type, raw_text=text, stage=self.session.stage)
 
-        # Conversational greetings
-        words = t.strip().split()
-        if (t in ("hello", "hi", "hey", "namaste", "namaskar", "good morning", "good evening") or
-            (len(words) <= 2 and words and words[0] in ("hello", "hi", "hey", "namaste", "namaskar"))):
-            lang = self.session.language
-            greeting = GREETINGS.get(lang, GREETINGS["en"])
-            await self.push_frame(TTSSpeakFrame(greeting))
-            await self.push_frame(ui_message({
-                "type": "BOT_RESPONSE",
-                "text": greeting,
-                "turn_id": self.session.current_turn_id,
-                "turn_seq": self.session.turn_generation,
-            }))
-            if self.context and self.context.messages:
-                self.context.messages.append({"role": "assistant", "content": greeting})
-            return True
-
-        # Handle active ride queries
+        # Stage 6a: Active ride queries
         if self.session.stage == "RIDE_ACTIVE":
             if is_cancellation_intent(text):
                 ok = await self.session.cancel_ride(self.push_frame)
@@ -864,60 +933,8 @@ class SessionController(FrameProcessor):
                 }))
                 return True
 
-            return False
-
-        # Guard: Confirmation intent when no trip proposal or destination confirmation exists
-        if self.session.stage in ("GREETING", "AWAITING_DESTINATION") and is_confirmation_intent(text):
-            lang = self.session.language
-            if lang == "hi":
-                spoken = "आपने अभी तक कोई गंतव्य नहीं चुना है। आप कहाँ जाना चाहेंगे?"
-            elif lang == "mr":
-                spoken = "आपण अद्याप कोणतेही ठिकाण निवडलेले नाही. आपण कुठे जाऊ इच्छिता?"
-            else:
-                spoken = f"You haven't selected a destination yet. Where in {se.DEFAULT_CITY_NAME} would you like to go?"
-            await self.push_frame(TTSSpeakFrame(spoken))
-            await self.push_frame(ui_message({
-                "type": "BOT_RESPONSE",
-                "text": spoken,
-                "turn_id": self.session.current_turn_id,
-                "turn_seq": self.session.turn_generation,
-            }))
-            if self.context and self.context.messages:
-                self.context.messages.append({"role": "assistant", "content": spoken})
-            return True
-
-        # Guard: Cancellation intent when no proposal or active ride exists
-        if self.session.stage in ("GREETING", "AWAITING_DESTINATION") and is_cancellation_intent(text):
-            lang = self.session.language
-            if lang == "hi":
-                spoken = "अभी कोई ऐक्टिव राइड या बुकिंग नहीं है। आप कहाँ जाना चाहेंगे?"
-            elif lang == "mr":
-                spoken = "सध्या कोणतीही सक्रिय राईड किंवा बुकिंग नाही. आपण कुठे जाऊ इच्छिता?"
-            else:
-                spoken = "You don't have an active ride or booking to cancel. Where would you like to go?"
-            await self.push_frame(TTSSpeakFrame(spoken))
-            await self.push_frame(ui_message({
-                "type": "BOT_RESPONSE",
-                "text": spoken,
-                "turn_id": self.session.current_turn_id,
-                "turn_seq": self.session.turn_generation,
-            }))
-            if self.context and self.context.messages:
-                self.context.messages.append({"role": "assistant", "content": spoken})
-            return True
-
-        # 1. Candidate confirmation during destination clarification (Stage 1 of Two-Phase Confirmation)
-        if self.session.stage == "AWAITING_DESTINATION_CONFIRMATION" and self.session.pending_destination:
-            if is_cancellation_intent(text):
-                self.session.pending_destination = None
-                self.session.stage = "AWAITING_DESTINATION"
-                lang = self.session.language
-                if lang == "hi":
-                    spoken = "ठीक है, आप कहाँ जाना चाहेंगे?"
-                elif lang == "mr":
-                    spoken = "ठीक आहे, आपण कुठे जाऊ इच्छिता?"
-                else:
-                    spoken = "Alright, where would you like to go instead?"
+            if se.is_general_query(text) or any(w in t for w in ("thank", "thanks", "hello", "hi")):
+                spoken = f"Your ride with booking ID {self.session.booking_id} is active in simulation mode. Let me know if you wish to cancel."
                 await self.push_frame(TTSSpeakFrame(spoken))
                 await self.push_frame(ui_message({
                     "type": "BOT_RESPONSE",
@@ -927,24 +944,22 @@ class SessionController(FrameProcessor):
                 }))
                 return True
 
-            if is_confirmation_intent(text):
-                # User confirmed the suggested destination!
-                cand = self.session.pending_destination
-                self.session.pending_destination = None
-                logger.info(f"[{self.session.session_id}] Destination confirmed by user -> {cand['name']}")
-                # Calculates route & fare, transitions to AWAITING_CONFIRMATION, and presents fare proposal (does NOT book yet)
-                await self._resolve_and_preview_trip(cand["lat"], cand["lon"], cand["name"])
-                return True
+            return False
 
-            # If user spoke a new destination instead of affirming/denying, clear and fall through
-            self.session.pending_destination = None
-            self.session.stage = "AWAITING_DESTINATION"
+        # Stage 6b: Proposal Stage (Stage 2 of Two-Phase Confirmation)
+        if self.session.stage == "AWAITING_CONFIRMATION" and self.session.pending_ride:
+            ride = self.session.pending_ride
+            dest = ride.get("destination", "your destination")
+            fare = round(ride.get("fare_inr", 0))
+            dist = ride.get("distance_km", 0.0)
+            dur = ride.get("duration_mins", 0)
 
-        # 2. Booking confirmation or cancellation in proposal stage (Stage 2 of Two-Phase Confirmation)
-        if self.session.stage == "AWAITING_CONFIRMATION":
+            # Check 1: Explicit cancellation of proposal
             if is_cancellation_intent(text):
                 self.session.stage = "AWAITING_DESTINATION"
                 self.session.pending_ride = None
+                self.session.proposal_id = None
+                self.session.proposal_version = 0
                 lang = self.session.language
                 if lang == "hi":
                     spoken = "ट्रिप कैंसिल कर दी गई है। आप कहाँ जाना चाहेंगे?"
@@ -967,11 +982,122 @@ class SessionController(FrameProcessor):
                 }))
                 return True
 
+            # Check 2: Trip or Pricing Inquiry without altering proposal state
+            is_fare_inquiry = bool(re.search(r"\b(?:fare|price|cost|how much|rupees|kitna|kitne)\b", t))
+            is_dist_time_inquiry = bool(re.search(r"\b(?:distance|far|duration|time|how long|how far|minute|min|kitna time|dur)\b", t))
+            if is_fare_inquiry or is_dist_time_inquiry:
+                lang = self.session.language
+                if lang == "hi":
+                    spoken = f"{dest} के लिए अनुमानित किराया {fare} रुपये है और दूरी {dist:.1f} किलोमीटर है। क्या मैं राइड बुक करूँ?"
+                elif lang == "mr":
+                    spoken = f"{dest} साठी अंदाजे भाडे {fare} रुपये आहे आणि अंतर {dist:.1f} किलोमीटर आहे. मी राईड बुक करू का?"
+                else:
+                    spoken = f"The trip to {dest} is {dist:.1f} km with an estimated fare of {fare} rupees. Shall I confirm this ride?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                return True
+
+            # Check 3: Conversational statement, pause, or politeness during proposal
+            if se.is_general_query(text) or any(w in t for w in ("wait", "hold on", "one moment", "thank you", "thanks")):
+                lang = self.session.language
+                if any(w in t for w in ("wait", "hold on", "one moment", "thoda ruko", "ek minute", "thamba")):
+                    spoken = f"Sure, take your time. Let me know when you are ready to confirm your ride to {dest}."
+                elif any(w in t for w in ("thank", "thanks", "dhanyawad", "shukriya")):
+                    spoken = f"You're welcome! Shall I go ahead and confirm the ride to {dest} for {fare} rupees?"
+                elif any(w in t for w in ("hear me", "are you there", "listening")):
+                    spoken = f"Yes, I can hear you clearly! Would you like to confirm the ride to {dest} for {fare} rupees?"
+                else:
+                    spoken = f"We have a ride proposal to {dest} for {fare} rupees ready. Would you like to confirm it, or change the destination?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                return True
+
+            # Check 4: Natural Confirmation -> advances exactly once
             if is_confirmation_intent(text):
                 await self._confirm_current_booking()
                 return True
 
-        # 3. Candidate resolution during disambiguation
+            # Check 5: Destination Change / Correction
+            new_dest_candidate = se.extract_destination_entity(text)
+            has_explicit_change = any(p in t for p in ("instead", "actually", "change to", "change destination", "rather", "different"))
+            is_different_dest = False
+            if new_dest_candidate and len(new_dest_candidate) >= 3:
+                norm_curr = re.sub(r"[^a-zA-Z0-9]+", "", dest.lower())
+                norm_new = re.sub(r"[^a-zA-Z0-9]+", "", new_dest_candidate.lower())
+                if norm_new and norm_new not in norm_curr and norm_curr not in norm_new:
+                    is_different_dest = True
+
+            if has_explicit_change or is_different_dest:
+                logger.info(f"[{self.session.session_id}] Proposal destination change: current={dest!r}, new={new_dest_candidate!r}")
+                self.session.pending_ride = None
+                self.session.proposal_id = None
+                self.session.proposal_version = 0
+                self.session.stage = "AWAITING_DESTINATION"
+                # Fall through to destination search below for the new destination
+            else:
+                spoken = f"I have a pending ride to {dest} for {fare} rupees. You can say 'confirm' to book, or tell me if you'd like to change the destination."
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                return True
+
+        # Stage 6c: Destination Candidate Confirmation (Stage 1 of Two-Phase Confirmation)
+        if self.session.stage == "AWAITING_DESTINATION_CONFIRMATION" and self.session.pending_destination:
+            cand = self.session.pending_destination
+            if is_cancellation_intent(text):
+                self.session.pending_destination = None
+                self.session.stage = "AWAITING_DESTINATION"
+                lang = self.session.language
+                if lang == "hi":
+                    spoken = "ठीक है, आप कहाँ जाना चाहेंगे?"
+                elif lang == "mr":
+                    spoken = "ठीक आहे, आपण कुठे जाऊ इच्छिता?"
+                else:
+                    spoken = "Alright, where would you like to go instead?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                return True
+
+            if is_confirmation_intent(text):
+                self.session.pending_destination = None
+                logger.info(f"[{self.session.session_id}] Destination confirmed by user -> {cand['name']}")
+                await self._resolve_and_preview_trip(cand["lat"], cand["lon"], cand["name"])
+                return True
+
+            if se.is_general_query(text) or any(w in t for w in ("wait", "hold on", "one moment", "thank you", "thanks")):
+                spoken = f"I asked if you'd like to go to {cand['name']}. Would you like me to calculate the route there, or choose another destination?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                return True
+
+            self.session.pending_destination = None
+            self.session.stage = "AWAITING_DESTINATION"
+
+        # Stage 6d: Candidate resolution during disambiguation
         if self.session.stage == "DISAMBIGUATING" and self.session.last_search:
             if is_cancellation_intent(text):
                 self.session.stage = "AWAITING_DESTINATION"
@@ -992,13 +1118,124 @@ class SessionController(FrameProcessor):
                 await self._resolve_and_preview_trip(cand["lat"], cand["lon"], cand["name"])
                 return True
 
+            if se.is_general_query(text) or any(w in t for w in ("wait", "hold on", "one moment", "thank you", "thanks")):
+                spoken = "Please let me know which of the options you would prefer, or name a different destination."
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                return True
+
+            self.session.last_search = None
+            self.session.stage = "AWAITING_DESTINATION"
+
+        # Stage 6e: Guards & general remarks in GREETING / AWAITING_DESTINATION
+        if self.session.stage in ("GREETING", "AWAITING_DESTINATION"):
+            if is_confirmation_intent(text):
+                lang = self.session.language
+                if lang == "hi":
+                    spoken = "आपने अभी तक कोई गंतव्य नहीं चुना है। आप कहाँ जाना चाहेंगे?"
+                elif lang == "mr":
+                    spoken = "आपण अद्याप कोणतेही ठिकाण निवडलेले नाही. आपण कुठे जाऊ इच्छिता?"
+                else:
+                    spoken = f"You haven't selected a destination yet. Where in {se.DEFAULT_CITY_NAME} would you like to go?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                if self.context and self.context.messages:
+                    self.context.messages.append({"role": "assistant", "content": spoken})
+                return True
+
+            if is_cancellation_intent(text):
+                lang = self.session.language
+                if lang == "hi":
+                    spoken = "अभी कोई ऐक्टिव राइड या बुकिंग नहीं है। आप कहाँ जाना चाहेंगे?"
+                elif lang == "mr":
+                    spoken = "सध्या कोणतीही सक्रिय राईड किंवा बुकिंग नाही. आपण कुठे जाऊ इच्छिता?"
+                else:
+                    spoken = "You don't have an active ride or booking to cancel. Where would you like to go?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                if self.context and self.context.messages:
+                    self.context.messages.append({"role": "assistant", "content": spoken})
+                return True
+
+            words = t.strip().split()
+            if (t in ("hello", "hi", "hey", "namaste", "namaskar", "good morning", "good evening") or
+                (len(words) <= 2 and words and words[0] in ("hello", "hi", "hey", "namaste", "namaskar"))):
+                lang = self.session.language
+                greeting = GREETINGS.get(lang, GREETINGS["en"])
+                await self.push_frame(TTSSpeakFrame(greeting))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": greeting,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                if self.context and self.context.messages:
+                    self.context.messages.append({"role": "assistant", "content": greeting})
+                return True
+
+            if se.is_general_query(text) or any(w in t for w in ("wait", "hold on", "one moment", "thank you", "thanks")):
+                lang = self.session.language
+                if any(w in t for w in ("thank", "thanks", "dhanyawad", "shukriya")):
+                    spoken = f"You're welcome! Where would you like to go in {se.DEFAULT_CITY_NAME} today?"
+                elif any(w in t for w in ("wait", "hold on", "one moment", "thoda ruko", "ek minute", "thamba")):
+                    spoken = f"Sure, take your time. Let me know whenever you're ready to book a cab in {se.DEFAULT_CITY_NAME}."
+                elif any(w in t for w in ("hear me", "are you there", "listening")):
+                    spoken = f"Yes, I can hear you clearly! Where in {se.DEFAULT_CITY_NAME} would you like to go?"
+                elif any(w in t for w in ("who are you", "what are you", "what can you do")):
+                    spoken = f"I am Disha, your voice concierge for Bharat Online Cabs in {se.DEFAULT_CITY_NAME}. Just tell me your destination and I'll arrange your ride."
+                else:
+                    spoken = f"I am Disha, your voice concierge for Bharat Online Cabs in {se.DEFAULT_CITY_NAME}. Where would you like to go today?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                if self.context and self.context.messages:
+                    self.context.messages.append({"role": "assistant", "content": spoken})
+                return True
+
         # 4. Fast Deterministic Destination Evaluation (Sub-Second Routing & Disambiguation)
-        # Note: also evaluated when in AWAITING_CONFIRMATION or AWAITING_DESTINATION_CONFIRMATION to seamlessly change destination
-        if self.session.stage in ("GREETING", "AWAITING_DESTINATION", "AWAITING_DESTINATION_CONFIRMATION", "DISAMBIGUATING", "AWAITING_CONFIRMATION"):
+        if self.session.stage in ("GREETING", "AWAITING_DESTINATION"):
             captured_seq = self.session.turn_generation
             turn_ref = self.session.current_turn_id or "turn-000"
 
             clean_dest = se.extract_destination_entity(text)
+            if not clean_dest:
+                lang = self.session.language
+                if lang == "hi":
+                    spoken = f"आप {se.DEFAULT_CITY_NAME} में कहाँ जाना चाहेंगे?"
+                elif lang == "mr":
+                    spoken = f"आपण {se.DEFAULT_CITY_NAME}मध्ये कुठे जाऊ इच्छिता?"
+                else:
+                    spoken = f"Where in {se.DEFAULT_CITY_NAME} would you like to go?"
+                await self.push_frame(TTSSpeakFrame(spoken))
+                await self.push_frame(ui_message({
+                    "type": "BOT_RESPONSE",
+                    "text": spoken,
+                    "turn_id": self.session.current_turn_id,
+                    "turn_seq": self.session.turn_generation,
+                }))
+                if self.context and self.context.messages:
+                    self.context.messages.append({"role": "assistant", "content": spoken})
+                return True
+
             is_cat = clean_dest.lower() in se.COMMON_CATEGORIES or any(c in clean_dest.lower() for c in se.COMMON_CATEGORIES)
             # Stage 7: Entity/Category extraction
             TurnTracer.trace(7, "ENTITY_EXTRACTION", self.session.session_id, turn_ref,
@@ -1166,18 +1403,64 @@ class SessionController(FrameProcessor):
 
         return False
 
-    async def _execute_text_turn(self, text: str, turn_id: str, curr_seq: int):
+    async def execute_turn(
+        self,
+        text: str,
+        source: str = "voice",
+        turn_id: str | None = None,
+        turn_seq: int | None = None,
+        language: str | None = None,
+        vad_speech_s: float | None = None,
+        stt_ms: float | None = None,
+    ) -> bool:
+        curr_task = asyncio.current_task()
+        if self._turn_task and not self._turn_task.done() and self._turn_task is not curr_task:
+            logger.info(f"[{self.session.session_id}] Cancelling in-flight turn {self.session.current_turn_id} for new incoming {source} turn")
+            self._turn_task.cancel()
+
+        if turn_seq is not None:
+            curr_seq = turn_seq
+            self.session.turn_generation = max(self.session.turn_generation, turn_seq)
+            curr_turn_id = turn_id or f"turn-{self.session.turns:03d}"
+        else:
+            self.session.turn_generation += 1
+            self.session.turns += 1
+            curr_seq = self.session.turn_generation
+            curr_turn_id = turn_id or f"turn-{self.session.turns:03d}"
+
+        self.session.current_turn_id = curr_turn_id
+        self.session.greeting_sent = True
         self.session.is_processing_turn = True
+
+        if getattr(self, "user_stop_strategy", None):
+            await self.user_stop_strategy._discard_pending_end_of_turn()
+
+        # Stage 1: Turn ID & Session ID
+        TurnTracer.trace(1, "TURN_START", self.session.session_id, curr_turn_id,
+                         turn_seq=curr_seq, source=source, stage=self.session.stage)
+
+        msg_payload = {
+            "type": "USER_TRANSCRIPT",
+            "text": text,
+            "source": source,
+            "is_final": True,
+            "turn_id": curr_turn_id,
+            "turn_seq": curr_seq,
+        }
+        if language:
+            msg_payload["language"] = language
+        await self.push_frame(ui_message(msg_payload))
+
+        t_intent_start = time.time()
+        handled = False
         try:
-            t_intent_start = time.time()
-            handled = False
-            try:
-                handled = await asyncio.wait_for(
-                    self._handle_text_turn(text),
-                    timeout=7.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"[{self.session.session_id}][{turn_id}] Text operation timed out after 7.0s")
+            handled = await asyncio.wait_for(
+                self._handle_text_turn(text),
+                timeout=7.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.session.session_id}][{curr_turn_id}] Destination operation timed out after 7.0s ({source})")
+            if curr_seq >= self.session.turn_generation:
                 lang = self.session.language
                 if lang == "hi":
                     spoken = "सर्च में अधिक समय लग रहा है। कृपया दोबारा बताएं या कोई नजदीकी मुख्य स्थान बताएं।"
@@ -1188,42 +1471,59 @@ class SessionController(FrameProcessor):
                 await self.push_frame(ui_message({
                     "type": "ERROR",
                     "error": "Destination search timed out",
-                    "turn_id": turn_id,
+                    "turn_id": curr_turn_id,
                     "turn_seq": curr_seq,
                 }))
                 await self.push_frame(ui_message({
                     "type": "BOT_RESPONSE",
                     "text": spoken,
-                    "turn_id": turn_id,
+                    "turn_id": curr_turn_id,
                     "turn_seq": curr_seq,
                 }))
                 await self.push_frame(TTSSpeakFrame(spoken))
                 handled = True
-
-            intent_dur = time.time() - t_intent_start
-
-            if curr_seq != self.session.turn_generation:
-                logger.info(f"[{self.session.session_id}][{turn_id}] Discarding superseded text turn result")
-                return
-
-            await self.push_frame(ui_message({
-                "type": "PERF_DIAGNOSTICS",
-                "turn_id": turn_id,
-                "turn_seq": curr_seq,
-                "timings": {
-                    "intent_ms": round(intent_dur * 1000),
-                    "deterministic_fast_path": handled,
-                }
-            }))
-            if not handled:
-                await self.push_frame(
-                    LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True))
+                self.session.turn_generation += 1
+                self.session.is_processing_turn = False
         except asyncio.CancelledError:
-            logger.info(f"[{self.session.session_id}][{turn_id}] Text turn task cancelled")
+            logger.info(f"[{self.session.session_id}][{curr_turn_id}] Turn cancelled ({source})")
+            raise
         except Exception as e:
-            logger.exception(f"[{self.session.session_id}][{turn_id}] Text turn error: {e}")
+            logger.exception(f"[{self.session.session_id}][{curr_turn_id}] Turn error ({source}): {e}")
+            handled = False
         finally:
-            self.session.is_processing_turn = False
+            if self._turn_task is None or self._turn_task.done() or self._turn_task is curr_task or curr_seq >= self.session.turn_generation:
+                self.session.is_processing_turn = False
+
+        intent_dur = time.time() - t_intent_start
+
+        if curr_seq < self.session.turn_generation:
+            logger.info(f"[{self.session.session_id}][{curr_turn_id}] Discarding superseded {source} turn result")
+            return False
+
+        diag_timings = {
+            "intent_ms": round(intent_dur * 1000),
+            "deterministic_fast_path": handled,
+        }
+        if vad_speech_s is not None:
+            diag_timings["vad_speech_s"] = round(vad_speech_s, 2)
+        if stt_ms is not None:
+            diag_timings["stt_ms"] = round(stt_ms)
+            diag_timings["e2e_turn_ms"] = round((vad_speech_s or 0) * 1000 + stt_ms + intent_dur * 1000)
+
+        await self.push_frame(ui_message({
+            "type": "PERF_DIAGNOSTICS",
+            "turn_id": curr_turn_id,
+            "turn_seq": curr_seq,
+            "timings": diag_timings,
+        }))
+
+        if not handled:
+            await self.push_frame(
+                LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True))
+        return handled
+
+    async def _execute_text_turn(self, text: str, turn_id: str, curr_seq: int):
+        return await self.execute_turn(text, source="text", turn_id=turn_id, turn_seq=curr_seq)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -1258,10 +1558,10 @@ class SessionController(FrameProcessor):
                 return
 
             if mtype == "INTERRUPT_PLAYBACK":
-                if self._turn_task and not self._turn_task.done():
-                    self._turn_task.cancel()
+                was_speaking = getattr(self.session, "is_bot_speaking", False)
                 self.session.is_bot_speaking = False
-                await self.push_frame(InterruptionFrame())
+                if was_speaking:
+                    await self.push_frame(InterruptionFrame())
                 return
 
             if mtype == "SET_LANGUAGE":
@@ -1312,6 +1612,9 @@ class SessionController(FrameProcessor):
                 return
 
             if mtype == "CANCEL_RIDE":
+                if self._turn_task and not self._turn_task.done():
+                    self._turn_task.cancel()
+                self.session.is_processing_turn = False
                 if self.session.stage == "RIDE_ACTIVE":
                     await self.session.cancel_ride(self.push_frame)
                     lang = self.session.language
@@ -1326,6 +1629,11 @@ class SessionController(FrameProcessor):
                 elif self.session.stage == "AWAITING_CONFIRMATION":
                     self.session.stage = "AWAITING_DESTINATION"
                     self.session.pending_ride = None
+                    self.session.pending_destination = None
+                    self.session.last_search = None
+                    self.session.greeting_sent = False
+                    self.session.is_processing_turn = False
+                    self.session.turn_generation += 1
                     await self.push_frame(ui_message({
                         "type": "RIDE_CANCELLED",
                         "reason": "PROPOSAL_CANCELLED",
@@ -1335,14 +1643,16 @@ class SessionController(FrameProcessor):
                 return
 
             if mtype == "START_VOICE_SESSION":
-                if not self.session.greeting_sent and self.session.turns == 0:
+                if self._turn_task is None or self._turn_task.done():
+                    self.session.is_processing_turn = False
+                if not self.session.greeting_sent:
                     self.session.greeting_sent = True
                     greeting = GREETINGS.get(self.session.language, GREETINGS["en"])
                     await self.push_frame(TTSSpeakFrame(greeting))
                     await self.push_frame(ui_message({
                         "type": "BOT_RESPONSE",
                         "text": greeting,
-                        "turn_id": "turn-000",
+                        "turn_id": f"turn-{self.session.turns:03d}",
                         "turn_seq": self.session.turn_generation,
                     }))
                 return
@@ -1363,18 +1673,10 @@ class SessionController(FrameProcessor):
                 self.session.current_turn_id = turn_id
                 curr_seq = self.session.turn_generation
 
-                await self.push_frame(ui_message({
-                    "type": "USER_TRANSCRIPT",
-                    "text": text,
-                    "source": "text",
-                    "is_final": True,
-                    "turn_id": turn_id,
-                    "turn_seq": curr_seq,
-                }))
-
-                if self._turn_task and not self._turn_task.done():
+                curr_task = asyncio.current_task()
+                if self._turn_task and not self._turn_task.done() and self._turn_task is not curr_task:
                     self._turn_task.cancel()
-                self._turn_task = asyncio.create_task(self._execute_text_turn(text, turn_id, curr_seq))
+                self._turn_task = asyncio.create_task(self.execute_turn(text, source="text", turn_id=turn_id, turn_seq=curr_seq))
                 return
             return
         await self.push_frame(frame, direction)
@@ -1412,16 +1714,22 @@ class TranscriptTap(FrameProcessor):
 
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._vad_start_time = time.time()
-            logger.info(f"[{self.session.session_id}] [VAD] Speech onset detected")
-            await self.push_frame(ui_message({"type": "VAD_SPEECH_START"}))
+            logger.info(f"[{self.session.session_id}] [VAD] Speech onset detected (seq={self.session.turn_generation})")
+            await self.push_frame(ui_message({
+                "type": "VAD_SPEECH_START",
+                "turn_seq": self.session.turn_generation,
+            }))
             await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._vad_stop_time = time.time()
             vad_dur = self._vad_stop_time - self._vad_start_time if self._vad_start_time else 0.0
-            logger.info(f"[{self.session.session_id}] [VAD] Speech stopped (speech duration: {vad_dur:.2f}s)")
-            await self.push_frame(ui_message({"type": "VAD_SPEECH_STOP"}))
+            logger.info(f"[{self.session.session_id}] [VAD] Speech stopped (speech duration: {vad_dur:.2f}s, seq={self.session.turn_generation})")
+            await self.push_frame(ui_message({
+                "type": "VAD_SPEECH_STOP",
+                "turn_seq": self.session.turn_generation,
+            }))
             await self.push_frame(frame, direction)
             return
 
@@ -1435,96 +1743,27 @@ class TranscriptTap(FrameProcessor):
             t_stt = time.time()
             vad_dur = self._vad_stop_time - self._vad_start_time if self._vad_start_time else 0.0
             stt_dur = t_stt - self._vad_stop_time if self._vad_stop_time else 0.0
-            self.session.turn_generation += 1
-            self.session.turns += 1
-            turn_id = f"turn-{self.session.turns:03d}"
-            self.session.current_turn_id = turn_id
-            curr_seq = self.session.turn_generation
+            lang_str = str(frame.language) if frame.language else None
 
-            # Stage 1: Turn ID & Session ID
-            TurnTracer.trace(1, "TURN_START", self.session.session_id, turn_id,
-                             turn_seq=curr_seq, source="voice", stage=self.session.stage)
-
-            logger.info(f"[{self.session.session_id}][{turn_id}][seq={curr_seq}] [TIMING] VAD: {vad_dur:.2f}s | STT: {stt_dur:.3f}s | Transcript: {text!r}")
-            self.session.greeting_sent = True
-            await self.push_frame(ui_message({
-                "type": "USER_TRANSCRIPT",
-                "text": text,
-                "source": "voice",
-                "is_final": True,
-                "turn_id": turn_id,
-                "turn_seq": curr_seq,
-                "language": str(frame.language) if frame.language else None,
-            }))
-
-            # Lock turn as processing and cancel any pending user-speech timers
-            self.session.is_processing_turn = True
             if self.user_stop_strategy:
                 await self.user_stop_strategy._discard_pending_end_of_turn()
 
-            t_intent_start = time.time()
-            handled = False
+            if self.controller._turn_task and not self.controller._turn_task.done():
+                self.controller._turn_task.cancel()
+
+            self.controller._turn_task = asyncio.create_task(
+                self.controller.execute_turn(
+                    text=text,
+                    source="voice",
+                    language=lang_str,
+                    vad_speech_s=vad_dur,
+                    stt_ms=stt_dur * 1000,
+                )
+            )
             try:
-                handled = await asyncio.wait_for(
-                    self.controller._handle_text_turn(text),
-                    timeout=7.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"[{self.session.session_id}][{turn_id}] Spoken destination operation timed out after 7.0s")
-                lang = self.session.language
-                if lang == "hi":
-                    spoken = "सर्च में अधिक समय लग रहा है। कृपया दोबारा बताएं या कोई नजदीकी मुख्य स्थान बताएं।"
-                elif lang == "mr":
-                    spoken = "शोधण्यात जास्त वेळ लागत आहे. कृपया पुन्हा सांगा किंवा जवळचा मुख्य रस्ता सांगा."
-                else:
-                    spoken = "The destination search took too long. Please try again or specify a nearby landmark."
-
-                await self.push_frame(ui_message({
-                    "type": "ERROR",
-                    "error": "Destination search timed out",
-                    "turn_id": turn_id,
-                    "turn_seq": curr_seq,
-                }))
-                await self.push_frame(ui_message({
-                    "type": "BOT_RESPONSE",
-                    "text": spoken,
-                    "turn_id": turn_id,
-                    "turn_seq": curr_seq,
-                }))
-                await self.push_frame(TTSSpeakFrame(spoken))
-                handled = True
-            except Exception as e:
-                logger.exception(f"[{self.session.session_id}][{turn_id}] Error in _handle_text_turn: {e}")
-                handled = False
-            finally:
-                self.session.is_processing_turn = False
-
-            intent_dur = time.time() - t_intent_start
-            total_turn_dur = time.time() - self._vad_stop_time if self._vad_stop_time else intent_dur
-
-            if curr_seq != self.session.turn_generation:
-                logger.info(f"[{self.session.session_id}][{turn_id}] Discarding superseded voice turn result")
-                return
-
-            logger.info(f"[{self.session.session_id}][{turn_id}] [TIMING] Intent: {intent_dur:.3f}s | E2E Turn: {total_turn_dur:.3f}s (handled={handled})")
-
-            await self.push_frame(ui_message({
-                "type": "PERF_DIAGNOSTICS",
-                "turn_id": turn_id,
-                "turn_seq": curr_seq,
-                "timings": {
-                    "vad_speech_s": round(vad_dur, 2),
-                    "stt_ms": round(stt_dur * 1000),
-                    "intent_ms": round(intent_dur * 1000),
-                    "e2e_turn_ms": round(total_turn_dur * 1000),
-                    "deterministic_fast_path": handled,
-                }
-            }))
-
-            if not handled:
-                await self.push_frame(
-                    LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True)
-                )
+                await self.controller._turn_task
+            except asyncio.CancelledError:
+                logger.info(f"[{self.session.session_id}] Spoken turn task cancelled in TranscriptTap")
             return
 
         await self.push_frame(frame, direction)
@@ -1725,6 +1964,7 @@ async def get_config():
         "default_lat": se.DEFAULT_LAT,
         "default_lon": se.DEFAULT_LON,
         "default_city": se.DEFAULT_CITY,
+        "default_city_name": se.DEFAULT_CITY_NAME,
     }
 
 
@@ -1757,7 +1997,7 @@ def build_worker(websocket: WebSocket, session: Session) -> PipelineWorker:
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            serializer=BharatSerializer(),
+            serializer=BharatSerializer(session=session),
             session_timeout=30 * 60,
         ),
     )
@@ -1781,6 +2021,7 @@ def build_worker(websocket: WebSocket, session: Session) -> PipelineWorker:
     context = LLMContext(messages=[{"role": "system", "content": get_system_prompt(session.language)}], tools=TOOLS)
     controller = SessionController(session=session, context=context)
     user_stop_strategy = BharatUserTurnStopStrategy(session=session, user_speech_timeout=TURN_SPEECH_TIMEOUT)
+    controller.user_stop_strategy = user_stop_strategy
     transcript_tap = TranscriptTap(session=session, controller=controller, user_stop_strategy=user_stop_strategy)
 
     aggregators = LLMContextAggregatorPair(

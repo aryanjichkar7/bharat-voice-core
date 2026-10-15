@@ -14,9 +14,15 @@ Tests:
 """
 import os
 import sqlite3
+import sys
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import osm_indexer
 import spatial_engine as se
@@ -134,6 +140,28 @@ class TestStage2GLocalOsmSearch(unittest.TestCase):
             results = osm_indexer.query_local_places("Synthetic Test Point", 21.1458, 79.0882, db_path=db_path)
             self.assertGreaterEqual(len(results), 1)
             self.assertEqual(results[0]["name"], "Synthetic Test Point")
+
+    def test_stage2i_noisy_spoken_destinations_rejected_on_live_index(self):
+        """Verifies that actual spoken noise examples do not ground to unrelated nearest locations."""
+        # Query 1: Garbled phrase resembling no local place
+        res1 = se.evaluate_destination_intent("Shiva Adina Garb", se.DEFAULT_LAT, se.DEFAULT_LON)
+        self.assertEqual(res1["status"], "NOT_FOUND")
+        self.assertEqual(res1["resolution_type"], "NO_RESULTS")
+        self.assertIsNone(res1["primary_match"])
+        self.assertIsNone(res1.get("suggested_match"))
+
+        # Query 2: Conversational non-destination phrase
+        res2 = se.evaluate_destination_intent("The vehicle is your saloon", se.DEFAULT_LAT, se.DEFAULT_LON)
+        self.assertEqual(res2["status"], "NOT_FOUND")
+        self.assertEqual(res2["resolution_type"], "NO_RESULTS")
+        self.assertIsNone(res2["primary_match"])
+
+    def test_stage2i_category_word_boundary_isolation(self):
+        """Verifies that place names containing category substrings as subwords do not trigger category search."""
+        # "ambazari" contains "bar", but "bar" is part of the word, not a standalone category token
+        results = osm_indexer.query_local_places("ambazari", se.DEFAULT_LAT, se.DEFAULT_LON, radius_km=10.0)
+        # Ensure results are places matching "ambazari", not arbitrary bars across the city
+        self.assertTrue(all("bar" not in r["category"] or "ambazari" in r["name"].lower() for r in results))
 
 
 if __name__ == "__main__":

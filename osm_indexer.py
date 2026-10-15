@@ -22,10 +22,18 @@ from typing import Any
 
 from loguru import logger
 
-# Service area bounding box: ~25 km surrounding Nagpur
-NAGPUR_DEFAULT_LAT = 21.1458
-NAGPUR_DEFAULT_LON = 79.0882
-DEFAULT_SERVICE_BBOX = (20.92, 78.85, 21.37, 79.33)  # min_lat, min_lon, max_lat, max_lon
+# Service area configuration: configurable via environment
+DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "21.1458"))
+DEFAULT_LON = float(os.getenv("DEFAULT_LON", "79.0882"))
+DEFAULT_CITY_NAME = os.getenv("DEFAULT_CITY_NAME", "Nagpur")
+NAGPUR_DEFAULT_LAT = DEFAULT_LAT
+NAGPUR_DEFAULT_LON = DEFAULT_LON
+DEFAULT_SERVICE_BBOX = (
+    float(os.getenv("SERVICE_BBOX_MIN_LAT", "20.92")),
+    float(os.getenv("SERVICE_BBOX_MIN_LON", "78.85")),
+    float(os.getenv("SERVICE_BBOX_MAX_LAT", "21.37")),
+    float(os.getenv("SERVICE_BBOX_MAX_LON", "79.33")),
+)  # min_lat, min_lon, max_lat, max_lon
 
 OSM_ATTRIBUTION = "Data © OpenStreetMap contributors, ODbL 1.0"
 OSM_LICENSE_URL = "https://www.openstreetmap.org/copyright"
@@ -61,6 +69,7 @@ def _phonetic_skeleton(s: str) -> str:
     s = re.sub(r"c(?=[ei])", "s", s)
     s = re.sub(r"ph", "f", s)
     s = re.sub(r"w", "v", s)
+    s = re.sub(r"(?:tion|sion|shun)\b", "shn", s)
     s = re.sub(r"(.)\1+", r"\1", s)
     tokens = re.findall(r"[a-z0-9]+", s)
     res_tokens = []
@@ -680,7 +689,7 @@ def query_local_places(
         "bakery", "hotel", "supermarket", "park", "bar", "cinema", "mall",
         "clinic", "dhaba", "pub", "gym", "store", "shop"
     )
-    matched_cat = next((c for c in common_cats if c in norm_q), None)
+    matched_cat = next((c for c in common_cats if re.search(r"\b" + re.escape(c) + r"\b", norm_q)), None)
     if matched_cat and len(candidates_map) < limit * 2:
         cur.execute("""
             SELECT p.*
@@ -711,6 +720,14 @@ def query_local_places(
         l_q = len(compact_q)
         for r in cur.fetchall():
             c_comp = r["name_compacted"] or r["name_normalized"].replace(" ", "")
+            # Avoid comparing whole compact string for multi-token queries if no token overlaps
+            if len(tokens) >= 2:
+                c_tokens = r["name_normalized"].split()
+                if not any(
+                    (len(qt) >= 3 and any(ct.startswith(qt[:3]) or qt.startswith(ct[:3]) for ct in c_tokens))
+                    for qt in tokens
+                ):
+                    continue
             if abs(len(c_comp) - l_q) <= 4 or c_comp.startswith(compact_q[:3]) or compact_q.startswith(c_comp[:3]):
                 sim = SequenceMatcher(None, compact_q, c_comp).ratio()
                 if sim >= 0.65 and r["id"] not in candidates_map:
@@ -740,6 +757,13 @@ def query_local_places(
             s_phon = 1.0 if (q_skel and q_skel == c.get("phonetic")) else 0.0
             s_cont = 1.0 if (compact_q in c_comp or c_comp in compact_q) and min(len(compact_q), len(c_comp)) >= 4 else 0.0
             name_sim = max(s_char, s_phon * 0.90, s_cont * 0.88)
+            # For multi-word queries, penalize if substantive token coverage is low
+            if len(tokens) >= 2:
+                c_toks = c_norm.split()
+                matched_t = sum(1 for t in tokens if any(ct == t or (len(t) >= 4 and ct.startswith(t[:4])) for ct in c_toks))
+                cov = matched_t / len(tokens)
+                if cov < 0.50:
+                    name_sim = name_sim * ((cov / 0.50) ** 2)
 
         # Proximity score
         prox_score = max(0.0, 1.0 - (dist / 30.0))
@@ -770,7 +794,7 @@ def query_local_places(
                 "name": c_name,
                 "name_alt": c.get("name_alt", ""),
                 "full_address": f"{c_name}, {c_short}" if c_short else c_name,
-                "short_address": c_short or "Nagpur",
+                "short_address": c_short or DEFAULT_CITY_NAME,
                 "lat": c["lat"],
                 "lon": c["lon"],
                 "distance_km": round(dist, 2),

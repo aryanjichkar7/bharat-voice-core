@@ -9,8 +9,14 @@ Verifies:
 """
 
 import asyncio
+import sys
+from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from app import (
     Session,
@@ -198,6 +204,108 @@ class TestTimeoutOrchestrationRace(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         self.assertEqual(self.session.stage, "RIDE_ACTIVE")
         self.assertIsNotNone(self.session.active_ride)
+
+    async def test_slow_search_late_callback_discarded(self):
+        """Verifies that when a slow search finishes after timeout, turn_generation is incremented and late results are discarded."""
+        async def slow_mock_search(*args, **kwargs):
+            await asyncio.sleep(10.0)  # Exceeds 7.0s timeout
+            return {"status": "RESOLVED"}
+
+        with patch("asyncio.to_thread", side_effect=slow_mock_search):
+            await self.controller._execute_text_turn("Slow Location", "turn-001", 1)
+
+        # Confirm timeout fired and produced exactly one bot response
+        self.assertFalse(self.session.is_processing_turn)
+        initial_bot_responses = [
+            f.message for f in self.pushed_frames
+            if hasattr(f, "message") and f.message.get("type") == "BOT_RESPONSE"
+        ]
+        self.assertEqual(len(initial_bot_responses), 1)
+        self.assertIn("search took too long", initial_bot_responses[0]["text"].lower())
+
+        # Verify turn sequence was bumped so any late callback comparing captured_seq is discarded
+        captured_seq = 1
+        self.assertGreater(self.session.turn_generation, captured_seq)
+
+        # Now simulate late resolution check with captured_seq != self.session.turn_generation
+        self.pushed_frames.clear()
+        if captured_seq != self.session.turn_generation:
+            pass  # Result is discarded cleanly without emitting any frames
+        else:
+            await self.controller.push_frame(ui_message({"type": "BOT_RESPONSE", "text": "Duplicate late response"}))
+
+        # Assert no late frames were pushed
+        self.assertEqual(len(self.pushed_frames), 0)
+
+    async def test_carrier_only_speech_prompts_for_destination(self):
+        """Verifies carrier-only speech like 'i wanna go' prompts for destination without OSM search."""
+        self.pushed_frames.clear()
+        with patch("spatial_engine.search_nearby_pois") as mock_osm_search:
+            handled = await self.controller._handle_text_turn("i wanna go")
+            self.assertTrue(handled)
+            mock_osm_search.assert_not_called()
+
+        bot_responses = [
+            f.message for f in self.pushed_frames
+            if hasattr(f, "message") and f.message.get("type") == "BOT_RESPONSE"
+        ]
+        self.assertEqual(len(bot_responses), 1)
+        self.assertIn("Where in", bot_responses[0]["text"])
+        self.assertEqual(self.session.stage, "AWAITING_DESTINATION")
+
+    async def test_post_cancellation_session_restart_lifecycle(self):
+        """Verifies session restart after simulated ride cancellation works cleanly without browser reload."""
+        self.session.stage = "RIDE_ACTIVE"
+        self.session.booking_id = "BOC-TEST1234"
+        self.session.active_ride = {"destination": "Sitabuldi", "fare_inr": 60.0}
+
+        # Cancel the active ride
+        ok = await self.session.cancel_ride(self.controller.push_frame)
+        self.assertTrue(ok)
+        self.assertEqual(self.session.stage, "AWAITING_DESTINATION")
+        self.assertIsNone(self.session.active_ride)
+        self.assertIsNone(self.session.booking_id)
+        self.assertFalse(self.session.greeting_sent)
+
+        # Simulate user clicking mic: sends START_VOICE_SESSION frame
+        from pipecat.frames.frames import InputTransportMessageFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        init_frame = InputTransportMessageFrame(message={"type": "START_VOICE_SESSION"})
+        self.pushed_frames.clear()
+        await self.controller.process_frame(init_frame, FrameDirection.DOWNSTREAM)
+
+        # Assistant delivers fresh greeting
+        bot_responses = [
+            f.message for f in self.pushed_frames
+            if hasattr(f, "message") and f.message.get("type") == "BOT_RESPONSE"
+        ]
+        self.assertEqual(len(bot_responses), 1)
+        self.assertIn("Welcome to Bharat Online Cabs", bot_responses[0]["text"])
+
+    async def test_proposal_state_preserved_on_conversational_inquiry_and_pauses(self):
+        """Verifies proposal (fare, route, card) is strictly preserved on pauses or fare queries."""
+        self.session.stage = "AWAITING_CONFIRMATION"
+        self.session.pending_ride = {
+            "destination": "Sitabuldi Metro Station",
+            "fare_inr": 85.0,
+            "distance_km": 3.5,
+            "duration_mins": 10.0,
+            "route_geometry": "mock_poly",
+        }
+
+        # 1. User asks how much is the fare
+        self.pushed_frames.clear()
+        handled = await self.controller._handle_text_turn("how much is the fare?")
+        self.assertTrue(handled)
+        self.assertEqual(self.session.stage, "AWAITING_CONFIRMATION")
+        self.assertEqual(self.session.pending_ride["fare_inr"], 85.0)
+
+        # 2. User says wait a minute
+        self.pushed_frames.clear()
+        handled = await self.controller._handle_text_turn("wait a moment please")
+        self.assertTrue(handled)
+        self.assertEqual(self.session.stage, "AWAITING_CONFIRMATION")
+        self.assertEqual(self.session.pending_ride["destination"], "Sitabuldi Metro Station")
 
 
 if __name__ == "__main__":

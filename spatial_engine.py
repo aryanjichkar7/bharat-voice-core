@@ -112,6 +112,7 @@ def _phonetic_skeleton(s: str) -> str:
     s = re.sub(r"c(?=[ei])", "s", s)
     s = re.sub(r"ph", "f", s)
     s = re.sub(r"w", "v", s)
+    s = re.sub(r"(?:tion|sion|shun)\b", "shn", s)
     s = re.sub(r"(.)\1+", r"\1", s)
     tokens = re.findall(r"[a-z0-9]+", s)
     res_tokens = []
@@ -131,77 +132,219 @@ def _token_jaccard(tokens1: list[str], tokens2: list[str]) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 
+# ----------------------------------------------------------------------------- Configurable matching thresholds
+EXACT_MATCH_NAME_THRESHOLD = 0.92
+EXACT_MATCH_COVERAGE_THRESHOLD = 0.85
+PLAUSIBLE_NAME_THRESHOLD = 0.65
+PLAUSIBLE_COVERAGE_THRESHOLD = 0.50
+POSSIBLE_MATCH_MIN_SCORE = 0.65
+DISAMBIGUATION_MIN_SCORE = 0.60
+DISAMBIGUATION_MAX_MARGIN = 0.12
+
+GENERIC_STOPWORDS = {
+    "the", "a", "an", "to", "for", "at", "in", "on", "of", "and", "&", "me", "us", "please"
+}
+
+GENERIC_TOPONYM_DESCRIPTORS = {
+    "road", "rd", "street", "st", "marg", "chowk", "chauk", "square", "sq",
+    "station", "stn", "stop", "nagar", "colony", "layout", "complex", "plaza",
+    "point", "corner", "junction", "junc", "rly", "railway", "metro",
+    "building", "tower", "towers", "center", "centre", "mall", "market",
+    "bazaar", "bazar", "gate", "bridge", "pool", "garden", "gardens", "park",
+    "house", "office", "hub", "lane", "circle"
+}
+
+
+def normalize_name_for_matching(text: str) -> str:
+    """Standardizes text for matching without collapsing word boundaries."""
+    if not text:
+        return ""
+    t = text.lower().strip()
+    t = re.sub(r"['’]s\b", "", t)
+    t = re.sub(r"[^\w\s\u0900-\u097f]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def token_match_score(q: str, c: str) -> float:
+    """Computes calibrated similarity between an individual query token and candidate token."""
+    if q == c:
+        return 1.0
+    l_max = max(len(q), len(c))
+    l_min = min(len(q), len(c))
+    ld = _levenshtein_distance(q, c)
+    max_edits = 1 if l_max <= 5 else 2
+    if ld <= max_edits:
+        return max(0.0, 1.0 - (ld / l_max))
+    if (q.startswith(c) or c.startswith(q)) and l_min >= 4:
+        return l_min / l_max
+    sq = _phonetic_skeleton(q)
+    sc = _phonetic_skeleton(c)
+    if len(sq) >= 3 and len(sc) >= 3 and _levenshtein_distance(sq, sc) <= 1:
+        return 0.85
+    return 0.0
+
+
+def _compound_token_match(tokens: list[str], target: str) -> float:
+    """Checks if a target string is a sequential compound of individual tokens (e.g. 'alpha' + 'place' -> 'alphaplace')."""
+    if not tokens or not target:
+        return 0.0
+    pos = 0
+    total_matched_len = 0
+    matched_tokens = 0
+    for q in tokens:
+        sub_c = target[pos:]
+        matched = False
+        for l in range(max(1, len(q) - 1), min(len(sub_c) + 1, len(q) + 3)):
+            cand_slice = sub_c[:l]
+            if not cand_slice:
+                continue
+            if token_match_score(q, cand_slice) >= 0.75:
+                pos += len(cand_slice)
+                total_matched_len += len(cand_slice)
+                matched_tokens += 1
+                matched = True
+                break
+        if not matched:
+            break
+    if matched_tokens == len(tokens) and total_matched_len >= len(target) - 2:
+        return total_matched_len / max(len(target), 1)
+    return 0.0
+
+
 def score_candidate(query: str, candidate: dict, user_lat: float, user_lon: float) -> dict:
     """
     Computes calibrated similarity score for a retrieved candidate place against the query.
     Signals combined:
-    1. Name exact match and token containment.
-    2. Character SequenceMatcher ratio and Levenshtein edit distance ratio.
+    1. Token-level recall and coverage across candidate name and legitimate locality.
+    2. Character edit distance (Levenshtein) and SequenceMatcher ratio on word-separated text.
     3. Generic phonetic consonant skeleton similarity.
-    4. Locality / address keyword match.
-    5. Proximity score (ensuring geographic distance does NOT override clear name match).
+    4. Legitimate locality / address keyword match (excluding candidate name tokens and city).
+    5. Proximity score (ensuring geographic distance does NOT make unrelated names appear valid).
     """
     q_clean = query.lower().strip()
-    c_name = candidate.get("name", "").lower().strip()
-    c_full = candidate.get("full_address", "").lower().strip()
-    c_short = candidate.get("short_address", "").lower().strip()
+    c_name = candidate.get("name", "").strip()
+    c_short = candidate.get("short_address", "").strip()
+    dist_km = candidate.get("distance_km", 99.0)
 
-    q_norm = _normalize(q_clean)
-    c_norm = _normalize(c_name)
+    q_norm = normalize_name_for_matching(q_clean)
+    c_norm = normalize_name_for_matching(c_name)
 
-    # 1. Exact match
-    if q_norm and q_norm == c_norm:
+    # 1. Token extraction
+    q_tokens = [t for t in q_norm.split() if t not in GENERIC_STOPWORDS and len(t) >= 2]
+    c_tokens = [t for t in c_norm.split() if t not in GENERIC_STOPWORDS and len(t) >= 2]
+    if not q_tokens:
+        q_tokens = q_norm.split() or [q_clean]
+    if not c_tokens:
+        c_tokens = c_norm.split() or [c_name.lower()]
+
+    # Legitimate locality tokens: tokens in short_address outside of candidate name and default city
+    loc_norm = normalize_name_for_matching(c_short)
+    c_name_tokens_set = set(c_norm.split())
+    loc_tokens = [t for t in loc_norm.split() if t not in GENERIC_STOPWORDS and t not in c_name_tokens_set and t != DEFAULT_CITY_NAME.lower() and len(t) >= 3]
+
+    # Substantive candidate tokens for precision calculation (excluding generic descriptors)
+    subst_c_tokens = [c for c in c_tokens if c not in GENERIC_TOPONYM_DESCRIPTORS] or c_tokens
+
+    # 2. Token-level matching matrix
+    q_matches = []
+    for q in q_tokens:
+        best_t = max([token_match_score(q, c) for c in c_tokens] + [0.0])
+        # Check locality if not matched in place name
+        if best_t < 0.70 and loc_tokens and any(token_match_score(q, lt) >= 0.75 for lt in loc_tokens):
+            best_t = max(best_t, 0.85)
+        q_matches.append(best_t)
+    token_coverage = sum(q_matches) / len(q_matches) if q_matches else 0.0
+
+    c_matches = [max([token_match_score(q, c) for q in q_tokens] + [0.0]) for c in subst_c_tokens]
+    token_precision = sum(c_matches) / len(c_matches) if c_matches else 0.0
+
+    # Compound word segmentation check (e.g. multi-word split vs single compound)
+    if len(c_tokens) == 1 and len(q_tokens) >= 2:
+        comp_score = _compound_token_match(q_tokens, c_tokens[0])
+        if comp_score >= 0.75:
+            token_coverage = max(token_coverage, comp_score)
+            token_precision = max(token_precision, comp_score)
+    elif len(q_tokens) == 1 and len(c_tokens) >= 2:
+        comp_score = _compound_token_match(c_tokens, q_tokens[0])
+        if comp_score >= 0.75:
+            token_coverage = max(token_coverage, comp_score)
+            token_precision = max(token_precision, comp_score)
+
+    # 3. Whole-phrase character and phonetic similarity
+    lev_phrase = _levenshtein_distance(q_norm, c_norm)
+    l_phrase_ratio = max(0.0, 1.0 - (lev_phrase / max(len(q_norm), len(c_norm), 1)))
+    s_phrase_ratio = SequenceMatcher(None, q_norm, c_norm).ratio()
+    char_sim = 0.5 * l_phrase_ratio + 0.5 * s_phrase_ratio
+
+    q_skel = _phonetic_skeleton(q_norm)
+    c_skel = _phonetic_skeleton(c_norm)
+    phonetic_sim = SequenceMatcher(None, q_skel, c_skel).ratio() if (q_skel and c_skel) else 0.0
+
+    # 4. Calibrated Name Similarity
+    t_clean = re.sub(r"^the\s+", "", q_norm)
+    c_clean = re.sub(r"^the\s+", "", c_norm)
+    if q_norm == c_norm or (bool(t_clean) and t_clean == c_clean):
         name_sim = 1.0
     else:
-        seq_ratio = SequenceMatcher(None, q_norm, c_norm).ratio()
-        max_len = max(len(q_norm), len(c_norm), 1)
-        lev_dist = _levenshtein_distance(q_norm, c_norm)
-        lev_ratio = max(0.0, 1.0 - (lev_dist / max_len))
+        raw_name_sim = 0.40 * token_coverage + 0.20 * token_precision + 0.25 * char_sim + 0.15 * phonetic_sim
+        if len(q_tokens) >= 2 and token_coverage < 0.50:
+            name_sim = raw_name_sim * ((token_coverage / 0.50) ** 2)
+        else:
+            name_sim = raw_name_sim
 
-        q_tokens = [t for t in re.findall(r"[a-z0-9]+", q_clean) if len(t) >= 2]
-        c_tokens = [t for t in re.findall(r"[a-z0-9]+", c_name) if len(t) >= 2]
-        jaccard = _token_jaccard(q_tokens, c_tokens)
+    # 5. Locality match
+    locality_sim = 1.0 if (loc_tokens and any(token_match_score(q, lt) >= 0.80 for q in q_tokens for lt in loc_tokens)) else 0.0
 
-        q_skel = _phonetic_skeleton(q_clean)
-        c_skel = _phonetic_skeleton(c_name)
-        skel_match = 1.0 if (q_skel and q_skel == c_skel) else (
-            SequenceMatcher(None, q_skel, c_skel).ratio() if (q_skel and c_skel) else 0.0
-        )
-
-        containment = 1.0 if (q_norm in c_norm or c_norm in q_norm) and min(len(q_norm), len(c_norm)) >= 4 else 0.0
-
-        name_sim = max(
-            seq_ratio * 0.4 + lev_ratio * 0.3 + jaccard * 0.3,
-            skel_match * 0.85 if skel_match >= 0.80 else 0.0,
-            containment * 0.88 if containment > 0 else 0.0,
-        )
-
-    # 2. Locality similarity (if query mentions neighborhood/locality)
-    locality_sim = 0.0
-    q_tokens = [t for t in re.findall(r"[a-z0-9]+", q_clean) if len(t) >= 3]
-    for tok in q_tokens:
-        if tok in c_short or tok in c_full:
-            locality_sim = 1.0
-            break
-
-    # 3. Proximity score: max 1.0 at user location, decaying to 0 at 30km
-    dist_km = candidate.get("distance_km", 99.0)
+    # 6. Proximity score
     prox_score = max(0.0, 1.0 - (dist_km / 30.0))
 
-    # Guard: Distance must never override a poor name match
-    if name_sim < 0.35:
-        total_score = name_sim * 0.5
-    elif name_sim >= 0.98:
-        total_score = round(0.85 * name_sim + 0.15 * prox_score, 4)
+    # Substantive query token match (ensures match is not solely on generic descriptors like 'road' or 'square')
+    subst_q_tokens = [q for q in q_tokens if q not in GENERIC_TOPONYM_DESCRIPTORS]
+    if subst_q_tokens:
+        has_substantive_match = any(
+            max([token_match_score(q, c) for c in c_tokens] + [0.0]) >= 0.70
+            or (loc_tokens and any(token_match_score(q, lt) >= 0.75 for lt in loc_tokens))
+            for q in subst_q_tokens
+        ) or (len(c_tokens) == 1 and len(q_tokens) >= 2 and _compound_token_match(q_tokens, c_tokens[0]) >= 0.75) or (len(q_tokens) == 1 and len(c_tokens) >= 2 and _compound_token_match(c_tokens, q_tokens[0]) >= 0.75)
     else:
-        total_score = round(0.70 * name_sim + 0.15 * locality_sim + 0.15 * prox_score, 4)
+        has_substantive_match = (name_sim >= 0.85)
+
+    single_token_plausible = True
+    if len(q_tokens) == 1:
+        is_cand_cat = any(cat in c_norm for cat in COMMON_CATEGORIES)
+        if not is_cand_cat and name_sim < 0.65:
+            single_token_plausible = False
+
+    # 7. Defensible Plausibility Gate
+    is_plausible = (
+        name_sim >= PLAUSIBLE_NAME_THRESHOLD
+        and has_substantive_match
+        and single_token_plausible
+        and (token_coverage >= PLAUSIBLE_COVERAGE_THRESHOLD or len(q_tokens) == 1)
+    )
+
+    if not is_plausible:
+        # Distance must never make an unrelated name appear valid
+        total_score = round(name_sim * 0.4, 4)
+        explanation = f"Unrelated candidate: name_sim={name_sim:.2f}, token_coverage={token_coverage:.2f}"
+    elif name_sim >= EXACT_MATCH_NAME_THRESHOLD and token_coverage >= EXACT_MATCH_COVERAGE_THRESHOLD:
+        total_score = round(0.88 * name_sim + 0.04 * locality_sim + 0.08 * prox_score, 4)
+        explanation = f"Strong match: name_sim={name_sim:.2f}, token_coverage={token_coverage:.2f}"
+    else:
+        total_score = round(0.75 * name_sim + 0.10 * locality_sim + 0.15 * prox_score, 4)
+        explanation = f"Plausible match: name_sim={name_sim:.2f}, token_coverage={token_coverage:.2f}, dist={dist_km:.1f}km"
 
     return {
         "candidate": candidate,
         "name_sim": round(name_sim, 3),
+        "token_coverage": round(token_coverage, 3),
+        "char_sim": round(char_sim, 3),
+        "phonetic_sim": round(phonetic_sim, 3),
         "locality_sim": round(locality_sim, 3),
         "prox_score": round(prox_score, 3),
+        "is_plausible": is_plausible,
         "total_score": total_score,
+        "explanation": explanation,
     }
 
 
@@ -263,17 +406,17 @@ def _query_variants(query: str) -> list[str]:
 
 def _extract_short_address(full_address: str) -> str:
     if not full_address:
-        return "Nagpur"
+        return DEFAULT_CITY_NAME
     parts = [p.strip() for p in full_address.split(",") if p.strip()]
     cleaned = []
     for p in parts:
         if re.search(r"india|\d{6}|maharashtra", p, re.IGNORECASE):
             continue
-        if re.search(r"^(nagpur|nagpur urban taluka|nagpur rural taluka|nagpur city)$", p, re.IGNORECASE):
+        if re.search(rf"^({re.escape(DEFAULT_CITY_NAME.lower())}|{re.escape(DEFAULT_CITY_NAME.lower())}\s+urban\s+taluka|{re.escape(DEFAULT_CITY_NAME.lower())}\s+rural\s+taluka|{re.escape(DEFAULT_CITY_NAME.lower())}\s+city)$", p, re.IGNORECASE):
             continue
         cleaned.append(p)
     if not cleaned:
-        return "Nagpur"
+        return DEFAULT_CITY_NAME
     if len(cleaned) == 1:
         return cleaned[0]
     return f"{cleaned[-2]}, {cleaned[-1]}" if len(cleaned) >= 2 else cleaned[0]
@@ -305,76 +448,153 @@ COMMON_CATEGORIES = {
     "jewellers", "sweets", "coffee", "store", "shop"
 }
 
-DESTINATION_PATTERNS = [
-    # 1. Composite booking command patterns (booking intention + destination combined)
-    r"^(?:actually\s+)?(?:(?:can|could|would)\s+(?:you|we)\s+)?(?:please\s+)?(?:kindly\s+)?(?:book|reserve|get|call|order|arrange|find)\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+)?(?:cab|ride|taxi|car)?\s*(?:from\s+here\s+)?(?:to|for|towards|at)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
-    r"^(?:(?:i|we)\s+)?(?:would\s+like|\'?d\s+like|wanted|want|wants|need|needed|plan|planning|wish)\s+(?:to\s+)?(?:book|get|call|order|reserve|take)?\s*(?:me\s+|us\s+)?(?:a\s+)?(?:cab|ride|taxi|car)\s+(?:to|for|towards|at)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
-    r"^(?:(?:i|we)\s+)?(?:need|want|wanted|require)\s+(?:a\s+)?(?:cab|ride|taxi|car)\s+(?:to|for|towards|at)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
-
-    # 2. Transit action patterns ("take me to", "drive to", "go to", "heading to")
-    r"^(?:actually\s+)?(?:(?:can|could|would)\s+(?:you|we)\s+)?(?:please\s+)?(?:take|drive|drop|head|bring|go)\s+(?:me\s+|us\s+)?(?:off\s+)?(?:from\s+here\s+)?(?:to|at|towards)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
-    r"^(?:(?:i\s+)?(?:would\s+like|\'?d\s+like|wanted|want|wants|need|needed|have|had|got|plan|planning|wish|wishing)\s+to\s+(?:go|reach|travel|head)(?:\s+to)?|i\s+(?:am\s+)?(?:going|heading)\s+to|i\'?m\s+(?:going|heading)\s+to|heading\s+to|going\s+to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+(?:please|pls|now|asap))?$",
-    r"^(?:let\'?s\s+go\s+to|go\s+to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
-    r"^(?:how\s+much\s+(?:to\s+go\s+)?to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
-    r"^(?:cab|ride|taxi)\s+(?:to|for)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
-    r"^(?:to)\s+(?:\b(?:the|a|an)\b\s+)?(.+?)(?:\s+please)?$",
-
-    # 3. Category search / inquiry patterns
-    r"^(?:can\s+you\s+)?(?:please\s+)?(?:find|search(?:\s+for)?|look(?:\s+for)?|show)\s+(?:me\s+)?(?:\b(?:a|an|the|any|some)\b\s+)?(?:good|nearby|nearest|best)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by|please))?$",
-    r"^(?:(?:i\s+(?:am\s+)?)?looking\s+for)\s+(?:\b(?:a|an|the|any|some)\b\s+)?(?:good|nearby|nearest|best)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by))?$",
-    r"^(?:is\s+there\s+(?:any|a|an)|are\s+there\s+(?:any|some))\s+(?:good|nearby|nearest)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by))?\??$",
-
-    # 4. Hindi patterns (Latin & Devanagari)
-    r"^(?:kripya\s+)?(?:koi\s+)?(?:achha\s+|najdeeki\s+|paas\s+ka\s+)?(.+?)\s+(?:dhundo|khojo|batao|dikhao)$",
-    r"^(?:mujhe|muje|humein|hume|hamko)\s+(.+?)\s+(?:jana\s+hai|chalo|le\s+chalo|pahuncha\s+do|chhod\s+do)$",
-    r"^(.+?)\s+(?:jana\s+hai|le\s+chalo|chhod\s+do|chalo|pahuncha\s+do)$",
-    r"^(?:कृपया\s+)?(?:कोई\s+)?(?:अच्छा\s+|नजदीकी\s+|पास\s+का\s+)?(.+?)\s+(?:ढूंढो|खोजो|बताओ|दिखाओ)$",
-    r"^(?:मुझे|मुजे|हमें|हमे|हमको)\s+(.+?)\s+(?:जाना\s+है|ले\s+चलो|छोड़\s+दो|पहुंचा\s+दो)$",
-    r"^(.+?)\s+(?:जाना\s+है|ले\s+चलो|छोड़\s+दो|पहुंचा\s+दो)$",
-
-    # 5. Marathi patterns (Latin & Devanagari)
-    r"^(?:mala\s+)?(?:ekhade\s+|javalche\s+)?(.+?)\s+(?:shodha|dakhva|sanga)$",
-    r"^(?:mala|aamhala)\s+(.+?)\s*(?:la|s|laa)?\s+(?:jaycha\s+ahe|jayche\s+aahe|pohachva)$",
-    r"^(.+?)\s*(?:la|s)\s+(?:jaycha\s+ahe|jayche\s+aahe|gheun\s+chala)$",
-    r"^(?:मला\s+)?(?:एखादे\s+|जवळचे\s+)?(.+?)\s+(?:शोधा|दाखवा|सांगा)$",
-    r"^(?:मला|आम्हाला)\s+(.+?)\s*(?:ला|स|कडे)?\s+(?:जायचे\s+आहे|नेऊन\s+सोडा|घेऊन\s+चला)$",
-    r"^(.+?)\s*(?:ला|स|कडे)\s+(?:जायचे\s+आहे|घेऊन\s+चला)$",
+CORRECTION_PREAMBLES = [
+    r"^(?:actually|change of plans|i changed my mind|no not that|not that|instead of that|instead|rather|on second thought|can we change destination to|change destination to|change to)[,\s]+",
+    r"^(?:can you|could you|would you|please|kindly)\s+",
 ]
+
+TRANSIT_INTENT_PATTERNS = [
+    r"\b(?:can\s+(?:i|we|you)\s+)?(?:book|reserve|get|call|order|arrange)\s+(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+)?(?:cab|ride|taxi|car)?\s*(?:from\s+here\s+)?(?:to|towards|at|for|near)\s+(?:\b(?:the|a|an)\b\s+)?(.+)",
+    r"\b(?:take|drive|drop|head|bring|go|reach|travel|heading|going)\s+(?:me\s+|us\s+)?(?:off\s+)?(?:from\s+here\s+)?(?:to|towards|at|for|near|into)\s+(?:\b(?:the|a|an)\b\s+)?(.+)",
+    r"\b(?:how\s+much\s+(?:to\s+go\s+)?to|what\s+is\s+the\s+fare\s+to|what\'s\s+the\s+fare\s+to|fare\s+to)\s+(?:\b(?:the|a|an)\b\s+)?(.+)",
+    r"\b(?:i\s+|we\s+)?(?:want|wanted|wants|wanna|need|needed|needs|wish|would\s+like|\'?d\s+like|plan|planning|gotta|gonna)\s+(?:to\s+reach\s+|(?:to\s+)?(?:go|travel|head|get|reach)\s+(?:to|towards|at|for|into)\s+|(?:to|towards|at|for)\s+)(?:\b(?:the|a|an)\b\s+)?(.+)",
+    r"\b(?:can\s+you\s+)?(?:find|search(?:\s+for)?|look(?:\s+for)?|show)\s+(?:me\s+)?(?:\b(?:a|an|the|any|some)\b\s+)?(?:good|nearby|nearest|best)?\s*(.+?)(?:\s+(?:nearby|near\s+me|around\s+here|close\s+by))?$",
+    r"^(?:to|towards|at|near|heading to|going to)\s+(?:\b(?:the|a|an)\b\s+)?(.+)",
+    r"(?:kripya\s+|कृपया\s+)?(?:mujhe|muje|hume|humein|hamko|मुझे|मुजे|हमें|हमे|हमको)?\s*(.+?)\s*(?:jana hai|le chalo|pahuncha do|chhod do|chalo|जाना है|ले चलो|पहुंचा दो|छोड़ दो)$",
+    r"(.+?)\s+(?:ke liye cab chahiye|cab chahiye|chahiye|चाहिए)$",
+    r"(?:krupaya\s+|कृपया\s+)?(?:mala|aamhala|मला|आम्हाला)?\s*(.+?)\s*(?:la|s|कडे|ला)?\s*(?:jaycha ahe|jayche aahe|pohachva|neun soda|gheun chala|जायचे आहे|घेऊन चला|नेऊन सोडा)$",
+]
+
+DESTINATION_PATTERNS = TRANSIT_INTENT_PATTERNS  # Preserved alias for external consumers
+
+
+def is_general_query(raw_text: str) -> bool:
+    """Detects general inquiries (weather, time, assistant identity, greetings, gratitude, pauses) that are not cab booking requests."""
+    t = raw_text.lower().strip().rstrip("?!., ")
+    if not t:
+        return False
+
+    # If text carries explicit transit verbal frames or prepositions, it is a transit request, NOT general query
+    if any(re.search(pat, t, re.IGNORECASE) for pat in TRANSIT_INTENT_PATTERNS):
+        return False
+    if re.search(r"\b(?:to|towards|reach|drop\s+(?:me\s+)?at|heading\s+for)\s+[a-zA-Z0-9\u0900-\u097f]{2,}", t):
+        return False
+
+    # 1. Informational & Capability queries
+    if re.match(r"^(?:what|who|why|tell me|explain|how are you|how do you|how does|what can you|what are you)\b", t):
+        if not re.match(r"^how\s+much\s+(?:to|for|is|does)\b", t):
+            return True
+
+    # 2. Greetings
+    if re.match(r"^(?:hello|hi|hey|namaste|namaskar|good\s+morning|good\s+afternoon|good\s+evening|howdy)\b", t):
+        return True
+
+    # 3. Gratitude & Politeness
+    if re.match(r"^(?:thank\s+you|thanks|thank\s+u|dhanyawad|dhanyavad|shukriya|much\s+appreciated)\b", t) or t in ("welcome", "you're welcome", "you are welcome"):
+        return True
+
+    # 4. Pacing & Pauses
+    if re.match(r"^(?:wait|wait\s+a\s+(?:minute|second|sec|moment)|hold\s+on|just\s+a\s+(?:minute|second|sec|moment)|one\s+moment|give\s+me\s+a\s+(?:second|sec|minute|moment)|thoda\s+ruko|ek\s+minute|zara\s+thamba|thamba)\b", t):
+        return True
+
+    # 5. Audio, Repetition & Comprehension inquiries
+    if re.match(r"^(?:can\s+you\s+hear\s+me|are\s+you\s+there|are\s+you\s+listening|can\s+you\s+repeat|repeat\s+that|what\s+did\s+you\s+say|pardon|pardon\s+me|awaz\s+nahi\s+aa\s+rahi|aiku\s+yet\s+nahi)\b", t):
+        return True
+
+    # 6. Indecision & Non-booking statements
+    if t in ("i don't know", "i dont know", "dont know", "not sure", "nothing", "never mind", "kuch nahi", "kahich nahi", "nko"):
+        return True
+
+    return False
+
+
+CARRIER_PATTERNS = [
+    r"^(?:i\s+|we\s+)?(?:want|wanna|need|gotta|gonna|wish|would\s+like|\'?d\s+like|plan|planning)\s*(?:to\s+)?(?:go|travel|head|get|reach|take|book)?\s*(?:a\s+)?(?:cab|ride|taxi|car)?$",
+    r"^(?:let\s*\'?s\s+|let\s+us\s+|can\s+(?:we|i)\s+|could\s+(?:we|i)\s+)?(?:go|head|travel|leave|start|move)$",
+    r"^(?:take|drive|drop|head|bring|go|reach|travel)\s*(?:me|us)?(?:\s+off)?$",
+    r"^(?:book|reserve|get|call|order|arrange)\s*(?:me\s+|us\s+|for\s+me\s+|for\s+us\s+)?(?:a\s+)?(?:cab|ride|taxi|car)?$",
+    r"^(?:a\s+)?(?:cab|ride|taxi|car)$",
+    r"^(?:go|travel|ride)$",
+    r"^(?:mujhe|muje|hume|humein|hamko|मुझे|मुजे|हमें|हमे|हमको)?\s*(?:jana hai|le chalo|chalo|pahuncha do|chhod do|जाना है|ले चलो|चलो|पहुंचा दो|छोड़ दो)$",
+    r"^(?:cab\s+chahiye|gaadi\s+chahiye|कैब\s+चाहिए|गाड़ी\s+चाहिए)$",
+    r"^(?:mala|aamhala|मला|आम्हाला)?\s*(?:jaycha ahe|jayche aahe|gheun chala|neun soda|pohachva|जायचे आहे|घेऊन चला|नेऊन सोडा)$",
+]
+
+CARRIER_WORDS = {
+    "go", "to go", "i wanna go", "wanna go", "want to go", "head", "travel",
+    "leave", "reach", "get", "take me", "drop me", "cab", "ride", "taxi", "car",
+    "a cab", "a ride", "a taxi", "me", "us", "here", "there", "somewhere",
+    "anywhere", "now", "today", "please", "chalo", "jana hai", "le chalo",
+    "jaycha ahe", "cab chahiye"
+}
+
+
+def is_transit_carrier_only(text: str) -> bool:
+    """Checks whether the utterance consists entirely of transit verbs or carrier phrases without a destination entity."""
+    t = text.lower().strip().rstrip(".?!, ")
+    if not t:
+        return True
+    if t in CARRIER_WORDS:
+        return True
+    return any(re.match(pat, t, re.IGNORECASE) for pat in CARRIER_PATTERNS)
 
 
 def extract_destination_entity(raw_query: str) -> str:
-    """Extract destination entity from conversational phrasing in English, Hindi, or Marathi."""
+    """
+    Extracts destination entity from free-form natural language across English, Hindi, and Marathi.
+    Handles varied sentence structures, bare destinations, conversational preambles, and corrections.
+    Returns empty string if query is a general query, carrier-only phrase, or contains no destination entity.
+    """
     if not raw_query:
         return ""
-    t = raw_query.strip().rstrip(".?!,")
-    for pat in DESTINATION_PATTERNS:
-        m = re.match(pat, t, re.IGNORECASE)
-        if m:
-            extracted = m.group(1).strip()
-            # Strip trailing Marathi postposition if attached to place name
-            if extracted.lower().endswith("la") and len(extracted) > 4:
-                extracted = extracted[:-2].strip()
-            elif extracted.endswith("ला") and len(extracted) > 2:
-                extracted = extracted[:-2].strip()
-            # Strip trailing fillers from extracted
-            extracted = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now)$", "", extracted, flags=re.IGNORECASE).strip()
-            return extracted
+    if is_general_query(raw_query) or is_transit_carrier_only(raw_query):
+        return ""
+    t = raw_query.strip().rstrip(".?!, ")
 
-    # Fallback heuristic: extract target of prepositional direction if conversational preamble was unparsed
-    fallback_m = re.search(r"\b(?:to|towards|reach|drop\s+(?:me\s+)?at|heading\s+for|for)\s+(?:the\s+|a\s+|an\s+)?([a-zA-Z0-9\s]{2,})$", t, re.IGNORECASE)
-    if fallback_m:
-        cand = fallback_m.group(1).strip()
-        cand = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now)$", "", cand, flags=re.IGNORECASE).strip()
-        if len(cand) >= 2 and not any(cand.lower() == w for w in ("here", "there", "it", "now", "today", "please", "me", "us")):
+    # 1. Strip conversational & corrective preambles
+    for pat in CORRECTION_PREAMBLES:
+        t = re.sub(pat, "", t, flags=re.IGNORECASE).strip()
+
+    if is_transit_carrier_only(t):
+        return ""
+
+    # 2. Match generalized transit verbal frames
+    for pat in TRANSIT_INTENT_PATTERNS:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            cand = m.group(1).strip()
+            cand = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now|asap)$", "", cand, flags=re.IGNORECASE)
+            cand = re.sub(r"\s+by\s+\d+(?::\d+)?(?:\s*[ap]m)?$", "", cand, flags=re.IGNORECASE)
+            if cand.lower().endswith("la") and len(cand) > 4:
+                cand = cand[:-2].strip()
+            elif cand.endswith("ला") and len(cand) > 2:
+                cand = cand[:-2].strip()
+            if is_transit_carrier_only(cand):
+                return ""
             return cand
 
-    return t
+    # 3. Prepositional fallback heuristic
+    fallback_m = re.search(r"\b(?:to|towards|reach|drop\s+(?:me\s+)?at|heading\s+for|for)\s+(?:the\s+|a\s+|an\s+)?([a-zA-Z0-9\s\u0900-\u097f]{2,})$", t, re.IGNORECASE)
+    if fallback_m:
+        cand = fallback_m.group(1).strip()
+        cand = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now|asap)$", "", cand, flags=re.IGNORECASE).strip()
+        if len(cand) >= 2 and not any(cand.lower() == w for w in ("here", "there", "it", "now", "today", "please", "me", "us")):
+            if is_transit_carrier_only(cand):
+                return ""
+            return cand
+
+    # 4. Bare destination / unadorned place name
+    cand = re.sub(r"^(?:the|a|an)\s+", "", t, flags=re.IGNORECASE).strip()
+    cand = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now|asap)$", "", cand, flags=re.IGNORECASE).strip()
+    if is_transit_carrier_only(cand):
+        return ""
+    return cand
 
 
 def parse_natural_intent_and_destination(raw_text: str) -> dict:
     """
     Parses natural language requests into structured intent, destination entity, and category.
-    Handles composite requests expressing both booking intent and destination together.
+    Classifies cancellation, confirmation, general non-booking queries, and ride booking intent.
     """
     if not raw_text or not raw_text.strip():
         return {"intent": "UNKNOWN", "destination": None, "category": None, "raw": ""}
@@ -382,40 +602,46 @@ def parse_natural_intent_and_destination(raw_text: str) -> dict:
     t = raw_text.strip().rstrip(".?!, ")
     t_lower = t.lower()
 
-    # 1. Check for cancellation intent
-    if any(p in t_lower for p in ("cancel", "radd", "band karo", "stop", "dont book", "don't book", "never mind")):
+    # 1. Cancellation intent
+    if any(p in t_lower for p in ("cancel", "radd", "band karo", "stop", "dont book", "don't book", "never mind", "nahi chahiye", "nako")):
         return {"intent": "CANCELLATION", "destination": None, "category": None, "raw": t}
 
-    # 2. Extract destination entity using regex & grammar extraction
+    # 2. General non-booking queries
+    if is_general_query(t):
+        return {"intent": "GENERAL_QUERY", "destination": None, "category": None, "raw": t}
+
+    # 3. Confirmation intent
+    words = set(re.findall(r"\b[a-zA-Z']+\b", t_lower))
+    confirm_words = {
+        "yes", "confirm", "sure", "yep", "yeah", "haan", "ha", "ho", "done",
+        "correct", "right", "proceed", "ok", "okay", "alright", "perfect",
+        "fine", "great", "chalel", "kardo"
+    }
+    confirm_phrases = (
+        "book it", "book this", "please book", "book cab", "book a cab", "book the cab",
+        "confirm booking", "confirm ride", "kar do", "theek hai", "chalo", "sahi hai",
+        "that's right", "thats right", "go ahead", "sounds good", "looks good",
+        "that works", "works for me", "let's do it", "lets do it", "let's go", "lets go",
+        "please do", "go for it", "sure thing", "all right", "ha chalel", "ho chalel"
+    )
+    if (words & confirm_words) or any(p in t_lower for p in confirm_phrases):
+        if not re.search(r"\b(?:to|towards|reach|drop\s+(?:me\s+)?at|heading\s+for)\s+[a-zA-Z0-9\u0900-\u097f]{2,}", t_lower):
+            return {"intent": "CONFIRMATION", "destination": None, "category": None, "raw": t}
+
+    # 4. Extract destination entity
     extracted = extract_destination_entity(t)
     cleaned_dest = re.sub(r"\s+(?:please|pls|fast|now|kripya|jaldi|lavkar|right\s+now)$", "", extracted, flags=re.IGNORECASE).strip()
 
-    # Check if text is a booking command with destination
-    has_booking_verb = bool(re.search(r"\b(?:book|reserve|get|call|arrange|order)\b", t_lower))
-    has_transit_verb = bool(re.search(r"\b(?:take|drive|drop|head|go|reach|travel)\b", t_lower))
-    has_dest_preposition = bool(re.search(r"\b(?:to|towards|reach|for|at)\s+", t_lower))
+    # Reject conversational fillers from becoming destinations
+    if cleaned_dest.lower() in GENERIC_STOPWORDS or cleaned_dest.lower() in ("here", "there", "it", "now", "today", "please", "me", "us", "cab", "ride", "taxi", "car", "something", "anything"):
+        return {"intent": "UNKNOWN", "destination": None, "category": None, "raw": t}
 
     is_cat = cleaned_dest.lower() in COMMON_CATEGORIES or any(c in cleaned_dest.lower() for c in COMMON_CATEGORIES)
+    has_booking_verb = bool(re.search(r"\b(?:book|reserve|get|call|arrange|order)\b", t_lower))
 
-    if (has_booking_verb or has_transit_verb) and cleaned_dest and cleaned_dest.lower() != t_lower:
-        intent = "BOOK_CAB" if has_booking_verb else "DESTINATION_SEARCH"
-        return {
-            "intent": intent,
-            "destination": cleaned_dest,
-            "category": cleaned_dest if is_cat else None,
-            "raw": t
-        }
-
-    if has_dest_preposition and cleaned_dest and len(cleaned_dest) >= 2 and cleaned_dest.lower() != t_lower:
-        return {
-            "intent": "DESTINATION_SEARCH",
-            "destination": cleaned_dest,
-            "category": cleaned_dest if is_cat else None,
-            "raw": t
-        }
-
+    intent = "BOOK_CAB" if has_booking_verb else "DESTINATION_SEARCH"
     return {
-        "intent": "DESTINATION_SEARCH" if len(cleaned_dest) >= 2 else "UNKNOWN",
+        "intent": intent if len(cleaned_dest) >= 2 else "UNKNOWN",
         "destination": cleaned_dest if len(cleaned_dest) >= 2 else None,
         "category": cleaned_dest if is_cat else None,
         "raw": t
@@ -429,8 +655,8 @@ def sanitize_search_query(raw_query: str) -> str:
     # Strip leading generic articles/prepositions/qualifiers
     q = re.sub(r"^(?:the|a|an|to|at|for)\s+", "", q)
     q = re.sub(r"^(?:good|best|nearby|nearest|any|some)\s+", "", q)
-    # Strip common filler suffixes
-    q = re.sub(r"\s+(?:near\s+me|nearby|around\s+here|close\s+by|please|in\s+nagpur)$", "", q)
+    # Strip common filler suffixes using parameterized default city name
+    q = re.sub(rf"\s+(?:near\s+me|nearby|around\s+here|close\s+by|please|in\s+{re.escape(DEFAULT_CITY_NAME.lower())})$", "", q)
     q = q.strip()
 
     # Category synonym & plural normalization
@@ -775,13 +1001,29 @@ GENERIC_CATEGORY_KEYWORDS = (
 
 
 def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
-                                radius_km: float = 15.0) -> dict:
+                                radius_km: float = 15.0,
+                                candidates: list[dict] | None = None) -> dict:
     """
     Evaluates customer destination intent using candidate-grounded typo and phonetic recovery.
     Distinguishes 5 outcomes: EXACT_MATCH, POSSIBLE_MATCH, MULTIPLE_CANDIDATES, NO_RESULTS, PROVIDER_ERROR.
     """
     clean_dest = extract_destination_entity(query)
-    candidates = search_nearby_pois(clean_dest, user_lat, user_lon, radius_km=radius_km)
+    if not clean_dest:
+        return {
+            "status": "NOT_FOUND",
+            "resolution_type": "NO_RESULTS",
+            "query": query,
+            "primary_match": None,
+            "suggested_match": None,
+            "alternatives": [],
+            "outlet_count": 0,
+            "clarification_prompt": f"Where in {DEFAULT_CITY_NAME} would you like to go?",
+            "provider_status": 200,
+            "provider_error": None,
+            "confidence_score": 0.0,
+        }
+    if candidates is None:
+        candidates = search_nearby_pois(clean_dest, user_lat, user_lon, radius_km=radius_km)
     meta = dict(_last_search_meta)
 
     result = {
@@ -823,6 +1065,7 @@ def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
     # Score all candidates against user query
     scored = [score_candidate(clean_dest, c, user_lat, user_lon) for c in candidates]
     scored.sort(key=lambda s: s["total_score"], reverse=True)
+    plausible_scored = [s for s in scored if s["is_plausible"]]
     ranked_candidates = [s["candidate"] for s in scored]
 
     top = scored[0]
@@ -831,8 +1074,6 @@ def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
     second_score = scored[1]["total_score"] if len(scored) > 1 else 0.0
 
     result["outlet_count"] = len(ranked_candidates)
-    result["primary_match"] = top_cand
-    result["alternatives"] = ranked_candidates[1:]
     result["confidence_score"] = top_score
 
     # Human-friendly distance
@@ -843,10 +1084,11 @@ def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
     where = f" in {top_cand['short_address']}" if top_cand.get("short_address") else ""
 
     sanitized = sanitize_search_query(query)
+    q_lower = query.lower()
     is_generic = (
         sanitized in COMMON_CATEGORIES
-        or any(cat in sanitized for cat in COMMON_CATEGORIES)
-        or any(w in query.lower() for w in GENERIC_CATEGORY_KEYWORDS)
+        or any(re.search(r"\b" + re.escape(cat) + r"\b", q_lower) for cat in COMMON_CATEGORIES)
+        or any(re.search(r"\b" + re.escape(w) + r"\b", q_lower) for w in GENERIC_CATEGORY_KEYWORDS)
     )
 
     is_commercial = any(cat in top_cand.get("category", "") for cat in ("shop", "amenity", "commercial", "tourism/hotel"))
@@ -859,6 +1101,8 @@ def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
     if is_generic or (is_chain and top_score < 0.95):
         result["status"] = "DISAMBIGUATION_NEEDED"
         result["resolution_type"] = "MULTIPLE_CANDIDATES"
+        result["primary_match"] = top_cand
+        result["alternatives"] = ranked_candidates[1:]
         cat_label_map = {
             "jewellers": "jeweler",
             "cafe": "cafe",
@@ -889,23 +1133,31 @@ def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
         )
         return result
 
-    # Low confidence -> NO_RESULTS
-    if top_score < 0.50:
+    # Outcome: No defensible candidate meets the acceptance threshold -> NO_RESULTS
+    if not plausible_scored or top_score < POSSIBLE_MATCH_MIN_SCORE:
         result["status"] = "NOT_FOUND"
         result["resolution_type"] = "NO_RESULTS"
+        result["primary_match"] = None
+        result["suggested_match"] = None
+        result["alternatives"] = []
+        result["confidence_score"] = top_score
         result["clarification_prompt"] = (
-            f"I couldn't find '{display_q}' within {radius_km:.0f} km. "
+            f"I couldn't find a destination matching '{display_q}' within {radius_km:.0f} km. "
             "Could you tell me a nearby landmark or major road?"
         )
         return result
 
-    # High confidence -> EXACT_MATCH (strictly requires exact matching without typo/phonetic drift)
-    target_norm = _normalize(clean_dest)
-    top_name_norm = _normalize(top_cand["name"])
-    t_clean = re.sub(r"^the", "", target_norm)
-    c_clean = re.sub(r"^the", "", top_name_norm)
+    # From here on, top candidate is defensibly grounded and plausible
+    result["primary_match"] = top_cand
+    result["alternatives"] = [s["candidate"] for s in plausible_scored[1:]]
+
+    # Outcome: EXACT_MATCH (strictly requires exact normalized match without typo/phonetic drift)
+    target_norm = normalize_name_for_matching(clean_dest)
+    top_name_norm = normalize_name_for_matching(top_cand["name"])
+    t_clean = re.sub(r"^the\s+", "", target_norm)
+    c_clean = re.sub(r"^the\s+", "", top_name_norm)
     is_exact_name = (target_norm == top_name_norm or (bool(t_clean) and t_clean == c_clean))
-    if is_exact_name and not (len(scored) > 1 and top_score - second_score < 0.08 and second_score >= 0.80):
+    if is_exact_name and not (len(plausible_scored) > 1 and top_score - second_score < 0.08 and second_score >= 0.80):
         result["status"] = "EXACT"
         result["resolution_type"] = "EXACT_MATCH"
         result["clarification_prompt"] = (
@@ -913,17 +1165,22 @@ def evaluate_destination_intent(query: str, user_lat: float, user_lon: float,
         )
         return result
 
-    # Multiple close candidates
-    if len(scored) > 1 and (top_score - second_score < 0.10) and (second_score >= 0.50):
+    # Outcome: Multiple genuinely plausible close candidates -> MULTIPLE_CANDIDATES
+    if len(plausible_scored) > 1 and (top_score - second_score < DISAMBIGUATION_MAX_MARGIN) and (second_score >= DISAMBIGUATION_MIN_SCORE):
         result["status"] = "DISAMBIGUATION_NEEDED"
         result["resolution_type"] = "MULTIPLE_CANDIDATES"
+        opts_summary = []
+        for idx, s in enumerate(plausible_scored[:3], 1):
+            c = s["candidate"]
+            c_loc = f" in {c['short_address']}" if c.get("short_address") else ""
+            opts_summary.append(f"{idx}. {c['name']}{c_loc} ({c['distance_km']:.1f} km)")
+        options_text = ", ".join(opts_summary)
         result["clarification_prompt"] = (
-            f"Found multiple options. The closest is {top_cand['name']}{where}, about {dist_str} away. "
-            "Would you like to go there, or pick another from the map?"
+            f"I found multiple locations for '{display_q}': {options_text}. Which one would you prefer?"
         )
         return result
 
-    # Plausible single typo / phonetic match -> POSSIBLE_MATCH
+    # Outcome: Plausible single typo / phonetic match -> POSSIBLE_MATCH
     result["status"] = "POSSIBLE_MATCH"
     result["resolution_type"] = "POSSIBLE_MATCH"
     result["suggested_match"] = top_cand

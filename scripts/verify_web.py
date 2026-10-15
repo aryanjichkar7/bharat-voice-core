@@ -19,6 +19,11 @@ import urllib.request
 import urllib.error
 import psutil
 import websockets
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 PORT = int(os.getenv("WEB_PORT", "8000"))
 BASE_URL = f"http://127.0.0.1:{PORT}"
@@ -69,6 +74,7 @@ async def run_verification():
         stderr=subprocess.STDOUT,
         text=True,
         preexec_fn=os.setsid,
+        cwd=str(REPO_ROOT),
     )
 
     server_ps = psutil.Process(proc.pid)

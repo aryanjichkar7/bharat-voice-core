@@ -4,7 +4,8 @@
  * OpenStreetMap (Leaflet) cartography with responsive polyline, POI discovery, and honest dispatch telemetry.
  */
 
-// Configuration & Default Coordinates (Nagpur, MH)
+// Configuration & Default Coordinates (Configurable via /api/config)
+let defaultCityName = 'Nagpur';
 const DEFAULT_LAT = 21.1458;
 const DEFAULT_LON = 79.0882;
 const IN_SAMPLE_RATE = 16000;
@@ -38,8 +39,11 @@ let orbState = SESSION_STATES.READY;
 let speechStartTimeout = null;
 let idleListeningTimeout = null;
 let processingWatchdog = null;
+let interimWatchdog = null;
 let listeningCycleToken = 0;
 let lastCommittedTurnSeq = 0;
+let lastTerminalTurnSeq = 0;
+const timedOutTurnSeqs = new Set();
 let interimBubble = null;
 let nextPlayTime = 0;
 let activeAudioSources = [];
@@ -67,10 +71,29 @@ function clearProcessingWatchdog() {
   }
 }
 
+function clearInterimWatchdog() {
+  if (interimWatchdog) {
+    clearTimeout(interimWatchdog);
+    interimWatchdog = null;
+  }
+}
+
+function scheduleInterimWatchdog() {
+  clearInterimWatchdog();
+  interimWatchdog = setTimeout(() => {
+    if (isRecording && (currentSessionState === SESSION_STATES.PROCESSING || orbState === SESSION_STATES.PROCESSING || orbState === SESSION_STATES.LISTENING)) {
+      console.warn('[WATCHDOG] Interim transcript stagnant without finalization; transitioning to PROCESSING watchdog');
+      setOrbState(SESSION_STATES.PROCESSING, 'Finalizing transcription...');
+      scheduleProcessingWatchdog();
+    }
+  }, 4500);
+}
+
 function clearAllTimeouts() {
   clearSpeechStartTimeout();
   clearIdleListeningTimeout();
   clearProcessingWatchdog();
+  clearInterimWatchdog();
 }
 
 function scheduleSpeechStartTimeout(expectedCycle) {
@@ -107,9 +130,12 @@ function scheduleProcessingWatchdog() {
   clearProcessingWatchdog();
   processingWatchdog = setTimeout(() => {
     if (isRecording && (currentSessionState === SESSION_STATES.PROCESSING || orbState === SESSION_STATES.PROCESSING)) {
-      console.warn('[WATCHDOG] Operation timed out after 15s without server response');
+      console.warn('[WATCHDOG] Operation timed out after 10s without server response');
       stopAudioCapture('OPERATION_TIMEOUT');
       clearInterimTranscript();
+      clearInterimWatchdog();
+      timedOutTurnSeqs.add(clientTurnSeq);
+      lastTerminalTurnSeq = Math.max(lastTerminalTurnSeq, clientTurnSeq);
       setOrbState(SESSION_STATES.ERROR, 'Search request timed out. Tap orb to retry.');
       setTripPanelError('Search request timed out. Tap the orb to retry or specify a nearby landmark.');
       appendTranscript('bot', "The search request timed out. Please tap the orb to try again or specify a nearby landmark.");
@@ -117,7 +143,7 @@ function scheduleProcessingWatchdog() {
         ws.send(JSON.stringify({ type: 'INTERRUPT_PLAYBACK' }));
       }
     }
-  }, 15000);
+  }, 10000);
 }
 
 function enterListeningState(reason) {
@@ -129,6 +155,7 @@ function enterListeningState(reason) {
   const cycle = listeningCycleToken;
   console.info(`[LIFECYCLE] enterListeningState (cycle=${cycle}, reason=${reason})`);
   clearProcessingWatchdog();
+  clearInterimWatchdog();
   clearSpeechStartTimeout();
   clearIdleListeningTimeout();
   setOrbState(SESSION_STATES.LISTENING);
@@ -220,7 +247,7 @@ function clearTripPanelError() {
   }
   const guidanceTitle = cardIdleView.querySelector('.guidance-text strong');
   if (guidanceTitle) {
-    guidanceTitle.textContent = 'Start a Trip in Nagpur';
+    guidanceTitle.textContent = defaultCityName ? `Start a Trip in ${defaultCityName}` : 'Start a Trip';
   }
   const guidanceDesc = cardIdleView.querySelector('.guidance-text p');
   if (guidanceDesc) {
@@ -234,6 +261,14 @@ async function loadMapEngine() {
     const res = await fetch('/api/config');
     const config = await res.json();
     mapTileUrl = config.map_tile_url || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+    if (config.default_city_name) {
+      defaultCityName = config.default_city_name;
+      const titleElem = cardIdleView ? cardIdleView.querySelector('.guidance-text strong') : null;
+      if (titleElem && titleElem.textContent.includes('Start a Trip')) {
+        titleElem.textContent = `Start a Trip in ${defaultCityName}`;
+      }
+    }
 
     if (config.default_lat && config.default_lon) {
       userLocation.lat = config.default_lat;
@@ -410,6 +445,11 @@ function connectWebSocket() {
 // ----------------------------------------------------------------------------- 4. Audio Ingestion via AudioWorklet
 async function startAudioCapture() {
   try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.error('Cannot start audio capture: WebSocket is not open (readyState=' + (ws ? ws.readyState : 'null') + ')');
+      setOrbState(SESSION_STATES.ERROR, 'Could not reach voice dispatch. Tap to retry');
+      throw new Error('WebSocket not connected');
+    }
     setOrbState(SESSION_STATES.REQUESTING_MIC);
     const AudioCtxClass = window.AudioContext || window.webkitAudioContext;
     audioCaptureCtx = new AudioCtxClass();
@@ -446,6 +486,10 @@ async function startAudioCapture() {
             return;
           }
 
+          if (activeAudioSources.length > 0 || orbState === SESSION_STATES.SPEAKING) {
+            return;
+          }
+
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(e.data);
           }
@@ -472,6 +516,7 @@ async function startAudioCapture() {
     micProcessor = audioCaptureCtx.createScriptProcessor(bufferSize, 1, 1);
     micProcessor.onaudioprocess = (e) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (activeAudioSources.length > 0 || orbState === SESSION_STATES.SPEAKING) return;
       const inputFloat32 = e.inputBuffer.getChannelData(0);
       const resampled16k = downsampleBuffer(inputFloat32, audioCaptureCtx.sampleRate, IN_SAMPLE_RATE);
       const pcm16 = float32ToInt16(resampled16k);
@@ -612,7 +657,8 @@ function handleServerAudioBuffer(arrayBuffer) {
   setOrbState(SESSION_STATES.SPEAKING);
 }
 
-function interruptPlayback() {
+function interruptPlayback(sendToServer = true) {
+  const hadActivePlayback = activeAudioSources.length > 0;
   activeAudioSources.forEach(src => {
     try { src.stop(); } catch (e) {}
   });
@@ -623,7 +669,7 @@ function interruptPlayback() {
   if (workletNode) {
     workletNode.port.postMessage({ type: 'SET_PLAYBACK_MUTE', muted: false });
   }
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (sendToServer && hadActivePlayback && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'INTERRUPT_PLAYBACK' }));
   }
   if (isRecording) {
@@ -647,7 +693,7 @@ function handleServerTextMessage(text) {
     }
 
     // Drop stale frames for superseded turns unless it's a lifecycle confirmation
-    if (data.turn_seq !== undefined && data.turn_seq < lastCommittedTurnSeq && data.type !== 'CONVERSATION_CLEARED' && data.type !== 'BOOKING_CONFIRMED') {
+    if (data.turn_seq !== undefined && data.turn_seq < lastCommittedTurnSeq && data.type !== 'CONVERSATION_CLEARED' && data.type !== 'BOOKING_CONFIRMED' && data.type !== 'RIDE_CANCELLED' && data.type !== 'SESSION_READY') {
       console.info(`[DROPPED] Discarding obsolete server frame (${data.type}) for turn_seq ${data.turn_seq} (last committed: ${lastCommittedTurnSeq})`);
       return;
     }
@@ -682,10 +728,14 @@ function handleServerTextMessage(text) {
           return;
         }
         renderInterimTranscript(data.text, data.turn_seq);
+        recordActivity();
+        setOrbState(SESSION_STATES.PROCESSING, 'Listening...');
+        scheduleInterimWatchdog();
         break;
 
       case 'USER_TRANSCRIPT':
         // Final transcript replaces provisional bubble cleanly
+        clearInterimWatchdog();
         clearProcessingWatchdog();
         scheduleProcessingWatchdog();
         if (data.turn_seq) {
@@ -699,24 +749,37 @@ function handleServerTextMessage(text) {
         break;
 
       case 'STT_EMPTY':
+        clearInterimWatchdog();
         clearProcessingWatchdog();
         clearInterimTranscript();
+        lastTerminalTurnSeq = Math.max(lastTerminalTurnSeq, data.turn_seq !== undefined ? data.turn_seq : clientTurnSeq);
         if (isRecording && activeAudioSources.length === 0) {
           enterListeningState('STT_EMPTY_REARM');
         }
         break;
 
       case 'BOT_RESPONSE':
+        clearInterimWatchdog();
         clearProcessingWatchdog();
-        if (data.turn_seq) {
+        if (data.turn_seq !== undefined && (data.turn_seq < lastTerminalTurnSeq || timedOutTurnSeqs.has(data.turn_seq))) {
+          console.info(`[DROPPED] Discarding late BOT_RESPONSE for terminated turn_seq ${data.turn_seq} (lastTerminalTurnSeq: ${lastTerminalTurnSeq})`);
+          break;
+        }
+        if (data.turn_seq !== undefined) {
           clientTurnSeq = Math.max(clientTurnSeq, data.turn_seq);
+          lastTerminalTurnSeq = Math.max(lastTerminalTurnSeq, data.turn_seq);
         }
         appendTranscript('bot', data.text, data.msg_id, data.turn_seq);
         break;
 
       case 'CONVERSATION_CLEARED':
+        clearInterimWatchdog();
         clearProcessingWatchdog();
         clearInterimTranscript();
+        if (data.turn_seq !== undefined) {
+          clientTurnSeq = Math.max(clientTurnSeq, data.turn_seq);
+          lastTerminalTurnSeq = Math.max(lastTerminalTurnSeq, data.turn_seq);
+        }
         console.info('[TELEMETRY] Conversation cleared on server:', data);
         break;
 
@@ -734,10 +797,18 @@ function handleServerTextMessage(text) {
       case 'VAD_SPEECH_START':
         clearAllTimeouts();
         recordActivity();
+        if (activeAudioSources.length > 0) {
+          interruptPlayback(true);
+        }
         setOrbState(SESSION_STATES.PROCESSING, 'Listening to speech...');
         break;
 
       case 'VAD_SPEECH_STOP':
+        clearInterimWatchdog();
+        if (data.turn_seq !== undefined && data.turn_seq <= lastTerminalTurnSeq) {
+          console.info(`[LIFECYCLE] Ignoring late VAD_SPEECH_STOP for terminated turn_seq ${data.turn_seq} (lastTerminalTurnSeq: ${lastTerminalTurnSeq})`);
+          break;
+        }
         setOrbState(SESSION_STATES.PROCESSING, 'Finalizing response...');
         scheduleProcessingWatchdog();
         break;
@@ -761,14 +832,15 @@ function handleServerTextMessage(text) {
         break;
 
       case 'INTERRUPT':
-        interruptPlayback();
+        interruptPlayback(false);
         break;
 
       case 'ERROR':
+        clearInterimWatchdog();
         clearProcessingWatchdog();
+        clearInterimTranscript();
         console.error('Server error:', data.error);
         setTripPanelError(data.error);
-        appendTranscript('bot', `Error: ${data.error}`, data.msg_id, data.turn_seq);
         setOrbState(SESSION_STATES.ERROR, data.error);
         break;
 
@@ -807,9 +879,9 @@ function setLanguage(lang) {
   const initialBubble = document.getElementById('initialGreetingText');
   if (initialBubble) {
     const greetings = {
-      'en': 'Hello! Welcome to Bharat Online Cabs. Where in Nagpur would you like to go?',
-      'hi': 'नमस्ते! भारत ऑनलाइन कैब्स में आपका स्वागत है। आप नागपुर में कहाँ जाना चाहेंगे?',
-      'mr': 'नमस्कार! भारत ऑनलाईन कॅब्समध्ये आपले स्वागत आहे. आपण नागपूरमध्ये कुठे जाऊ इच्छिता?'
+      'en': `Hello! Welcome to Bharat Online Cabs. Where in ${defaultCityName} would you like to go?`,
+      'hi': `नमस्ते! भारत ऑनलाइन कैब्स में आपका स्वागत है। आप ${defaultCityName} में कहाँ जाना चाहेंगे?`,
+      'mr': `नमस्कार! भारत ऑनलाईन कॅब्समध्ये आपले स्वागत आहे. आपण ${defaultCityName}मध्ये कुठे जाऊ इच्छिता?`
     };
     initialBubble.textContent = greetings[lang] || greetings['en'];
   }
@@ -1294,6 +1366,9 @@ function clearConversationHistory() {
   clearInterimTranscript();
   interruptPlayback();
   clientTurnSeq++;
+  lastTerminalTurnSeq = clientTurnSeq;
+  lastCommittedTurnSeq = 0;
+  timedOutTurnSeqs.clear();
   lastRenderedRole = null;
   lastRenderedText = null;
   lastRenderedTime = 0;
@@ -1367,6 +1442,10 @@ voiceOrb.addEventListener('click', async () => {
   }
 
   if (!isRecording) {
+    if (currentRideState === 'CANCELLED') {
+      setTripCardState('idle');
+      clearTripPanelError();
+    }
     try {
       await connectWebSocket();
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1419,7 +1498,7 @@ if (btnChangeDestination) {
 if (btnPlanNewTrip) {
   btnPlanNewTrip.addEventListener('click', () => {
     recordActivity();
-    setTripCardState('idle');
+    clearConversationHistory();
   });
 }
 

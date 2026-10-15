@@ -28,12 +28,14 @@ from pipecat.frames.frames import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 class TestStage2SpeechAndLifecycle(unittest.IsolatedAsyncioTestCase):
 
     def test_01_no_hardcoded_venues(self):
         """Verify no hardcoded real-world venue dictionaries exist in application files."""
         for filename in ["app.py", "spatial_engine.py"]:
-            filepath = Path(__file__).parent / filename
+            filepath = REPO_ROOT / filename
             content = filepath.read_text(encoding="utf-8")
 
             # Check for suspicious venue lists or dictionaries
@@ -132,7 +134,7 @@ class TestStage2SpeechAndLifecycle(unittest.IsolatedAsyncioTestCase):
 
         # Verify TranscriptTap and TEXT_INPUT both emit is_final: True
         # Read code to confirm is_final: True in TranscriptTap and TEXT_INPUT
-        app_code = Path(__file__).parent / "app.py"
+        app_code = REPO_ROOT / "app.py"
         content = app_code.read_text(encoding="utf-8")
 
         self.assertIn('"type": "INTERIM_TRANSCRIPT"', content)
@@ -142,7 +144,7 @@ class TestStage2SpeechAndLifecycle(unittest.IsolatedAsyncioTestCase):
 
     def test_05_frontend_state_machine_and_timeouts(self):
         """Verify frontend app.js state machine constants and timeout durations."""
-        app_js = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
         # 1. State machine constants
         required_states = [
@@ -176,7 +178,7 @@ class TestStage2SpeechAndLifecycle(unittest.IsolatedAsyncioTestCase):
 
     def test_06_index_html_truthfulness(self):
         """Verify index.html contains truthful prototype simulation cards and no fake driver card."""
-        index_html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+        index_html = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
 
         self.assertIn("confirmedBookingId", index_html)
         self.assertIn("confirmedDistance", index_html)
@@ -235,7 +237,7 @@ class TestStage2SpeechAndLifecycle(unittest.IsolatedAsyncioTestCase):
 
     def test_08_stage2b_frontend_lifecycle_tokens_and_watchdog(self):
         """Verify Stage 2B: Frontend lifecycle token pattern, track stop reporting, and processing watchdog."""
-        app_js = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
         # 1. listeningCycleToken pattern
         self.assertIn("let listeningCycleToken = 0;", app_js)

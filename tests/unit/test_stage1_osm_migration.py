@@ -15,10 +15,15 @@ Tests:
 10. Strict Rule Verification: No hardcoded venue dictionaries in application code
 """
 import os
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from fastapi.testclient import TestClient
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import spatial_engine as se
 from app import app
@@ -32,10 +37,10 @@ class TestStage1OsmMigration(unittest.TestCase):
 
     def test_01_no_google_dependencies_in_active_code(self):
         """Ensure active application code contains zero calls to Google Places API or Google Maps JS SDK."""
-        app_code = Path("app.py").read_text(encoding="utf-8")
-        spatial_code = Path("spatial_engine.py").read_text(encoding="utf-8")
-        app_js = Path("static/app.js").read_text(encoding="utf-8")
-        index_html = Path("static/index.html").read_text(encoding="utf-8")
+        app_code = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
+        spatial_code = (REPO_ROOT / "spatial_engine.py").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static/app.js").read_text(encoding="utf-8")
+        index_html = (REPO_ROOT / "static/index.html").read_text(encoding="utf-8")
 
         # 1. No Google Maps JS script tag in HTML
         self.assertNotIn("maps.googleapis.com", index_html, "Google Maps JavaScript SDK script tag found in index.html")
@@ -53,10 +58,10 @@ class TestStage1OsmMigration(unittest.TestCase):
 
     def test_02_local_leaflet_vendor_assets_and_attribution(self):
         """Verify Leaflet vendor assets are stored locally and OSM attribution is rendered."""
-        css_path = Path("static/vendor/leaflet.css")
-        js_path = Path("static/vendor/leaflet.js")
-        index_html = Path("static/index.html").read_text(encoding="utf-8")
-        app_js = Path("static/app.js").read_text(encoding="utf-8")
+        css_path = REPO_ROOT / "static/vendor/leaflet.css"
+        js_path = REPO_ROOT / "static/vendor/leaflet.js"
+        index_html = (REPO_ROOT / "static/index.html").read_text(encoding="utf-8")
+        app_js = (REPO_ROOT / "static/app.js").read_text(encoding="utf-8")
 
         self.assertTrue(css_path.exists() and css_path.stat().st_size > 5000, "Local Leaflet CSS asset missing or invalid")
         self.assertTrue(js_path.exists() and js_path.stat().st_size > 50000, "Local Leaflet JS asset missing or invalid")
@@ -163,7 +168,7 @@ class TestStage1OsmMigration(unittest.TestCase):
 
     def test_10_no_hardcoded_venues_in_code_or_tests(self):
         """Verify no hardcoded venue lists or Nagpur venue dictionaries were added."""
-        spatial_code = Path("spatial_engine.py").read_text(encoding="utf-8")
+        spatial_code = (REPO_ROOT / "spatial_engine.py").read_text(encoding="utf-8")
         self.assertNotIn("NAGPUR_VENUES", spatial_code)
         self.assertNotIn("KNOWN_PLACES", spatial_code)
         self.assertNotIn("FALLBACK_VENUES", spatial_code)

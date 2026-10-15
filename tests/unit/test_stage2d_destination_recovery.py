@@ -20,8 +20,14 @@ Uses synthetic candidates (Alpha Tower, Central Point, Metro Station East, City 
 import asyncio
 import os
 import re
+import sys
+from pathlib import Path
 import unittest
 from unittest.mock import patch, MagicMock
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import spatial_engine as se
 from app import Session, SessionController, is_confirmation_intent, is_cancellation_intent
@@ -305,7 +311,7 @@ class TestStage2DDestinationRecovery(unittest.IsolatedAsyncioTestCase):
     # 7. Absence of Real-World Location Dictionaries in Production Code
     # -------------------------------------------------------------------------
     def test_no_hardcoded_venue_lists_in_production(self):
-        with open("spatial_engine.py", "r", encoding="utf-8") as f:
+        with open(REPO_ROOT / "spatial_engine.py", "r", encoding="utf-8") as f:
             code = f.read()
 
         # Must not contain hardcoded venue or shop dictionaries
@@ -314,12 +320,93 @@ class TestStage2DDestinationRecovery(unittest.IsolatedAsyncioTestCase):
             matches = re.findall(rf"\b{term}\b", code, re.IGNORECASE)
             self.assertEqual(len(matches), 0, f"Found hardcoded '{term}' in spatial_engine.py")
 
-        with open("app.py", "r", encoding="utf-8") as f:
+        with open(REPO_ROOT / "app.py", "r", encoding="utf-8") as f:
             app_code = f.read()
 
         for term in ["haldiram", "batukbhai", "dmart"]:
             matches = re.findall(rf"\b{term}\b", app_code, re.IGNORECASE)
             self.assertEqual(len(matches), 0, f"Found hardcoded '{term}' in app.py")
+
+    # -------------------------------------------------------------------------
+    # 8. Stage 2I: Dynamic Destination Matching and Confidence Calibration
+    # -------------------------------------------------------------------------
+    def test_stage2i_unrelated_noisy_input_rejected_without_primary_match(self):
+        """Verifies that phonetically and semantically unrelated noisy inputs are rejected without selecting a nearby place."""
+        synthetic_candidates = [
+            {
+                "name": "Alpha Tower",
+                "short_address": "Sector 4",
+                "full_address": "Alpha Tower, Sector 4, Metro Region",
+                "lat": 21.1460,
+                "lon": 79.0885,
+                "distance_km": 0.05,  # Extremely close (50m)
+            },
+            {
+                "name": "Central Market",
+                "short_address": "Main Hub",
+                "full_address": "Central Market, Main Hub",
+                "lat": 21.1470,
+                "lon": 79.0890,
+                "distance_km": 0.15,
+            }
+        ]
+
+        # Noisy input sharing no substantive tokens with candidate names
+        score = se.score_candidate("Shiva Adina Garb", synthetic_candidates[0], self.session.lat, self.session.lon)
+        self.assertFalse(score["is_plausible"], "Noisy query should fail plausibility gate")
+        self.assertLess(score["total_score"], 0.40, "Unrelated candidate score must be suppressed below 0.40")
+
+        # Destination intent evaluation must strictly return NO_RESULTS with primary_match = None
+        intent_res = se.evaluate_destination_intent("Shiva Adina Garb", self.session.lat, self.session.lon, candidates=synthetic_candidates)
+        self.assertEqual(intent_res["status"], "NOT_FOUND")
+        self.assertEqual(intent_res["resolution_type"], "NO_RESULTS")
+        self.assertIsNone(intent_res["primary_match"], "Unrelated input must not assign a primary match")
+
+    def test_stage2i_token_coverage_penalty_for_multi_word_queries(self):
+        """Verifies that a multi-word query where only a fraction of substantive words match is penalized."""
+        candidate = {
+            "name": "Silver Plaza",
+            "short_address": "Commercial Hub",
+            "full_address": "Silver Plaza, Commercial Hub",
+            "lat": 21.1500,
+            "lon": 79.0900,
+            "distance_km": 0.5,
+        }
+        # 1 out of 3 tokens matches ("Silver")
+        score = se.score_candidate("Silver Golden Diamond", candidate, self.session.lat, self.session.lon)
+        self.assertLess(score["token_coverage"], 0.40)
+        self.assertFalse(score["is_plausible"])
+        self.assertLess(score["total_score"], se.POSSIBLE_MATCH_MIN_SCORE)
+
+    def test_stage2i_candidate_choice_disambiguation_guards(self):
+        """Verifies that match_candidate_choice prevents hijacking of new destinations and word boundaries."""
+        from app import match_candidate_choice
+
+        options = [
+            {"name": "Central Mall Sitabuldi", "short_address": "Sitabuldi", "full_address": "Central Mall, Sitabuldi"},
+            {"name": "Central Mall Sadar", "short_address": "Sadar", "full_address": "Central Mall, Sadar"},
+            {"name": "Central Mall Dharampeth", "short_address": "Dharampeth", "full_address": "Central Mall, Dharampeth"},
+        ]
+
+        # 1. Ordinals
+        self.assertEqual(match_candidate_choice("first option", options)["short_address"], "Sitabuldi")
+        self.assertEqual(match_candidate_choice("option 2", options)["short_address"], "Sadar")
+        self.assertEqual(match_candidate_choice("the closest one", options)["short_address"], "Sitabuldi")
+
+        # 2. Candidate name/locality overlap
+        self.assertEqual(match_candidate_choice("take me to sadar", options)["short_address"], "Sadar")
+
+        # 3. Guard against destination command hijacking for unoffered location
+        # "take me to wardha road" must NOT resolve to options[0] just because of "take me"
+        self.assertIsNone(match_candidate_choice("take me to wardha road", options))
+
+        # 4. Guard against substring false positives ("someone" or "phone" matching "one")
+        self.assertIsNone(match_candidate_choice("someone is calling", options))
+        self.assertIsNone(match_candidate_choice("my phone battery", options))
+
+        # 5. Affirmative agreement
+        self.assertEqual(match_candidate_choice("take me there", options)["short_address"], "Sitabuldi")
+        self.assertEqual(match_candidate_choice("yes please", options)["short_address"], "Sitabuldi")
 
 
 if __name__ == "__main__":
